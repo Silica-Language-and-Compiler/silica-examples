@@ -1,0 +1,22 @@
+# Build output written next to each example by `silica build` / `silica run`
+# (also holds the FFI archives the CLI builds, e.g. libsilica_sockets.a)
+.silica-build/
+
+# Compiler artifacts, in case the compiler is ever run directly in an example folder
+*.sams
+*.iface
+*.o
+*.a
+silica.config
+silica.compile.*
+silica.atoms
+silica.shapes
+silica.link
+__silica_runtime.*
+
+# Editors and OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~

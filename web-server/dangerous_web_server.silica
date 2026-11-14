@@ -1,0 +1,123 @@
+// A minimal HTTP server: listens on 127.0.0.1:5173 and answers every request with
+// "Hello Web Server".
+//
+//   $ curl http://localhost:5173
+//   Hello Web Server
+//
+// It is built on the standard library's (:tcp) carrier (dangerous_tcp_carrier), a dangerous actor
+// over the Fifi socket wrappers. The listening carrier hands each accepted connection to a carrier
+// of its own; a session actor opens that connection, waits for the request bytes, writes one fixed
+// HTTP/1.1 response and closes it. The module is named dangerous_* because it depends on FFI
+// wrappers (dangerous FFI security model).
+//
+// SECURITY: plain TCP, no TLS. The listener binds loopback only ("listen:5173"), so only this
+// machine can reach it.
+module dangerous_web_server;
+
+use dangerous_tcp_carrier;
+
+fn region_dump_limit() -> int64 {
+    0
+}
+
+fn listen_address() -> string {
+    "listen:5173"
+}
+
+fn response() -> string {
+    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 17\r\nConnection: close\r\n\r\nHello Web Server\n"
+}
+
+// The compiler requires every program that spawns actors to register a failure reporter first
+// (spec §15.4.13.4). Each connection's carrier and session end normally when it closes; their
+// reports arrive here and are ignored.
+fn reporter(_report: string, state: { seen: int64 }) -> (:no_reply, { seen: int64 }) {
+    (:no_reply, { seen: state.seen + 1 })
+}
+
+// One connection: grant receive credit when it opens, answer the first bytes received, close, and
+// end when the carrier reports the link down.
+fn session(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom),
+           state: { car: dangerous_actor_ref, answered: boolean })
+    -> (:no_reply, { car: dangerous_actor_ref, answered: boolean }) {
+    case msg of {
+        (:link_up, _info: string) -> {
+            sequence proc[concurrency]
+                _: boolean <- cast(state.car, (:credit, 1) impl ActorMessage {})
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        (:rx, _request: string) -> case state.answered of {
+            true -> (:no_reply, state);
+            false -> {
+                sequence proc[concurrency]
+                    _: boolean <- cast(state.car, (:tx, response(), self()) impl ActorMessage {});
+                    _: boolean <- cast(state.car, :close impl ActorMessage {})
+                produces
+                    pure (:no_reply, { car: state.car, answered: true })
+                end
+            }
+        };
+        (:tx_credit, _n: int64) -> (:no_reply, state);
+        (:tx_failed, _why: atom) -> (:no_reply, state);
+        (:link_down, _why2: atom) -> {
+            sequence proc[concurrency]
+                _: atom <- stop_self(:normal)
+            produces
+                pure (:no_reply, state)
+            end
+        }
+    }
+}
+
+// The listener's owner: announces the port once bound, and gives each accepted connection a session.
+fn server(msg: (:link_up, string) | (:accepted, dangerous_actor_ref, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom),
+          state: { car: dangerous_actor_ref })
+    -> (:no_reply, { car: dangerous_actor_ref }) {
+    case msg of {
+        (:link_up, info: string) -> {
+            sequence proc[device_io]
+                _: atom <- print("Hello Web Server listening on 127.0.0.1, ");
+                _: atom <- println(info)
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        (:accepted, conn: dangerous_actor_ref, _peer: string) -> {
+            sequence proc[concurrency]
+                ses: actor_ref <- spawn({ car: conn, answered: false }, session, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                _: boolean <- cast(conn, (:open, ses, "") impl ActorMessage {})
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        (:rx, _segment: string) -> (:no_reply, state);
+        (:tx_credit, _n: int64) -> (:no_reply, state);
+        (:tx_failed, _why: atom) -> (:no_reply, state);
+        // The listener itself went down (for example, port 5173 already in use): stop the program.
+        (:link_down, why2: atom) -> {
+            sequence proc[concurrency, device_io]
+                _: atom <- print("listener down: ");
+                _: atom <- print_atom(why2);
+                _: atom <- println("");
+                _: boolean <- cast_exit(1)
+            produces
+                pure (:no_reply, state)
+            end
+        }
+    }
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        rep: actor_ref <- spawn({ seen: 0 }, reporter, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: atom <- register_failure_reporter(rep);
+        listener: dangerous_actor_ref <- spawn_dangerous({ owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false, listening: false, link_spec: "" }, dangerous_tcp_carrier@carrier, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        srv: actor_ref <- spawn({ car: listener }, server, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: boolean <- cast(listener, (:open, srv, listen_address()) impl ActorMessage {});
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

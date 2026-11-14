@@ -1,0 +1,14 @@
+// Hello, world in Silica.
+//
+// Printing is a device_io effect, so it happens inside a `sequence proc[device_io]` block.
+// main returns :ok, whose atom index (2) becomes the process exit status.
+//
+//   silica run examples/hello-world
+
+fn main() -> atom {
+    sequence proc[device_io]
+        _: atom <- println("Hello, world!")
+    produces
+        pure :ok
+    end
+}
