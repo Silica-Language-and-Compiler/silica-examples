@@ -1,0 +1,72 @@
+// A countdown driven by timers: an actor prints 5, 4, 3, 2, 1 half a second apart, then "Liftoff!"
+// with the time that passed.
+//
+//   5...
+//   4...
+//   3...
+//   2...
+//   1...
+//   Liftoff! after 2504 ms
+//
+// `send_after(delay_ms, target, message)` arranges for a message to arrive later. The countdown
+// actor sends a :tick to itself after each number, so each message schedules the next.
+// `monotonic_time` returns nanoseconds on a clock that never goes backwards, which is the right
+// clock for measuring elapsed time.
+//
+//   silica run countdown
+
+// How many memory regions to dump when an actor fails (none here).
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// The compiler requires every program that spawns actors to register a failure reporter first
+// (spec §15.4.13.4). This one counts the reports and ignores them.
+fn reporter(_report: string, state: int64) -> (:no_reply, int64) {
+    (:no_reply, state + 1)
+}
+
+// Milliseconds between numbers. send_after takes the delay as a uint64.
+fn tick_ms() -> uint64 {
+    500
+}
+
+// Each message (:start first, then :tick) prints one number and arms the next tick. :start also
+// records the start time. When no numbers are left, it prints the elapsed time and ends the program.
+fn countdown(msg: atom, state: { left: int64, started: int64 }) -> (:no_reply, { left: int64, started: int64 }) {
+    case state.left == 0 of {
+        true -> {
+            sequence proc[concurrency, device_io]
+                now: int64 <- monotonic_time();
+                _: atom <- print("Liftoff! after ");
+                _: atom <- print_int64((now - state.started) / 1000000);
+                _: atom <- println(" ms");
+                _: boolean <- cast_exit(0)
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        false -> {
+            sequence proc[concurrency, device_io]
+                now: int64 <- monotonic_time();
+                _: atom <- print_int64(state.left);
+                _: atom <- println("...");
+                _: timer_ref <- send_after(tick_ms(), self(), :tick impl ActorMessage {})
+            produces
+                pure (:no_reply, { left: state.left - 1, started: case msg of { :start -> now; _: atom -> state.started } })
+            end
+        }
+    }
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        rep: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: atom <- register_failure_reporter(rep);
+        c: actor_ref <- spawn({ left: 5, started: 0 }, countdown, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: boolean <- cast(c, :start impl ActorMessage {});
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

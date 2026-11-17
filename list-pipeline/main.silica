@@ -1,0 +1,108 @@
+// A list pipeline: build the numbers 1 to 10, square them, keep the even squares and add them up.
+//
+//   numbers: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+//   squares: [1, 4, 9, 16, 25, 36, 49, 64, 81, 100]
+//   even squares: [4, 16, 36, 64, 100]
+//   sum of even squares: 220
+//   length: 10
+//
+// A list's type names its element type and the memory space it lives in: List[int64, mem(normal)].
+// Building a list allocates, so `cons` and `nil` call prepend and empty inside
+// `sequence proc[mem(normal)]` blocks. map, filter and fold are ordinary recursive functions that
+// take function literals (`fn(x: int64) -> int64 { x * x }`) as arguments.
+//
+//   silica run list-pipeline
+
+// Puts x in front of rest. The list primitives take their element type and memory space explicitly.
+fn cons(x: int64, rest: List[int64, mem(normal)]) -> List[int64, mem(normal)] {
+    sequence proc[mem(normal)]
+        out: List[int64, mem(normal)] <- prepend[int64, mem(normal)](x, rest)
+    produces
+        pure out
+    end
+}
+
+fn nil() -> List[int64, mem(normal)] {
+    sequence proc[mem(normal)]
+        out: List[int64, mem(normal)] <- empty[int64, mem(normal)]()
+    produces
+        pure out
+    end
+}
+
+// The list patterns: [] is the empty list, [h, t] binds the head and the rest of the list.
+fn map(xs: List[int64, mem(normal)], f: fn(x: int64) -> int64) -> List[int64, mem(normal)] {
+    case xs of {
+        []: List[int64, mem(normal)] -> nil();
+        [h: int64, t: List[int64, mem(normal)]] -> cons(f(h), map(t, f))
+    }
+}
+
+fn filter(xs: List[int64, mem(normal)], keep: fn(x: int64) -> boolean) -> List[int64, mem(normal)] {
+    case xs of {
+        []: List[int64, mem(normal)] -> nil();
+        [h: int64, t: List[int64, mem(normal)]] -> case keep(h) of {
+            true -> cons(h, filter(t, keep));
+            false -> filter(t, keep)
+        }
+    }
+}
+
+fn fold(xs: List[int64, mem(normal)], acc: int64, f: fn(a: int64, x: int64) -> int64) -> int64 {
+    case xs of {
+        []: List[int64, mem(normal)] -> acc;
+        [h: int64, t: List[int64, mem(normal)]] -> fold(t, f(acc, h), f)
+    }
+}
+
+fn range(from: int64, to: int64) -> List[int64, mem(normal)] {
+    case from > to of {
+        true -> nil();
+        false -> cons(from, range(from + 1, to))
+    }
+}
+
+fn show(label: string, xs: List[int64, mem(normal)]) -> atom {
+    sequence proc[device_io]
+        _: atom <- print(label);
+        _: atom <- print_items(xs, true);
+        _: atom <- println("]")
+    produces
+        pure :ok
+    end
+}
+
+fn print_items(xs: List[int64, mem(normal)], first: boolean) -> atom {
+    case xs of {
+        []: List[int64, mem(normal)] -> :ok;
+        [h: int64, t: List[int64, mem(normal)]] -> {
+            sequence proc[device_io]
+                _: atom <- case first of { true -> print("["); false -> print(", ") };
+                _: atom <- print_int64(h)
+            produces
+                pure print_items(t, false)
+            end
+        }
+    }
+}
+
+fn main() -> int64 {
+    sequence proc[device_io, mem(normal)]
+        nums: List[int64, mem(normal)] <- range(1, 10);
+        squares: List[int64, mem(normal)] <- map(nums, fn(x: int64) -> int64 { x * x });
+        evens: List[int64, mem(normal)] <- filter(squares, fn(x: int64) -> boolean { x % 2 == 0 });
+        total: int64 <- fold(evens, 0, fn(a: int64, x: int64) -> int64 { a + x });
+        _: atom <- show("numbers: ", nums);
+        _: atom <- show("squares: ", squares);
+        _: atom <- show("even squares: ", evens);
+        _: atom <- print("sum of even squares: ");
+        _: atom <- print_int64(total);
+        _: atom <- println("");
+        n: int64 <- length[int64, mem(normal)](nums);
+        _: atom <- print("length: ");
+        _: atom <- print_int64(n);
+        _: atom <- println("")
+    produces
+        pure 0
+    end
+}

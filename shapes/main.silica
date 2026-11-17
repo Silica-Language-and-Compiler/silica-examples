@@ -1,0 +1,62 @@
+// Pattern matching on a sum type: a list of shapes, each a tagged tuple, with the area of each and
+// the total.
+//
+//   circle: 7.068577499999999
+//   rectangle: 12.0
+//   triangle: 7.5
+//   total area: 26.568577499999999
+//
+// A shape is one of three tuples, told apart by the atom in front:
+//
+//   (:circle, float64) | (:rect, float64, float64) | (:triangle, float64, float64)
+//
+// Silica has no type aliases, so the full sum type is written wherever a shape appears. `case`
+// picks the arm whose tag matches and binds the numbers in it. Give every variant an arm: a value
+// that matches no arm stops the program at run time with a case_clause failure.
+//
+//   silica run shapes
+
+fn area(s: (:circle, float64) | (:rect, float64, float64) | (:triangle, float64, float64)) -> float64 {
+    case s of {
+        (:circle, r: float64) -> 3.14159 * r * r;
+        (:rect, w: float64, h: float64) -> w * h;
+        (:triangle, b: float64, h2: float64) -> b * h2 / 2.0
+    }
+}
+
+fn name(s: (:circle, float64) | (:rect, float64, float64) | (:triangle, float64, float64)) -> string {
+    case s of {
+        (:circle, _r: float64) -> "circle";
+        (:rect, _w: float64, _h: float64) -> "rectangle";
+        (:triangle, _b: float64, _h2: float64) -> "triangle"
+    }
+}
+
+fn total(shapes: List[(:circle, float64) | (:rect, float64, float64) | (:triangle, float64, float64), mem(normal)]) -> float64 {
+    case shapes of {
+        []: List[(:circle, float64) | (:rect, float64, float64) | (:triangle, float64, float64), mem(normal)] -> 0.0;
+        [s: (:circle, float64) | (:rect, float64, float64) | (:triangle, float64, float64), rest: List[(:circle, float64) | (:rect, float64, float64) | (:triangle, float64, float64), mem(normal)]] -> {
+            sequence proc[device_io]
+                a: float64 <- area(s);
+                _: atom <- print(name(s));
+                _: atom <- print(": ");
+                _: atom <- print_float64(a);
+                _: atom <- println("")
+            produces
+                pure a + total(rest)
+            end
+        }
+    }
+}
+
+fn main() -> int64 {
+    sequence proc[device_io, mem(normal)]
+        shapes: List[(:circle, float64) | (:rect, float64, float64) | (:triangle, float64, float64), mem(normal)] <- [(:circle, 1.5), (:rect, 3.0, 4.0), (:triangle, 6.0, 2.5)];
+        sum: float64 <- total(shapes);
+        _: atom <- print("total area: ");
+        _: atom <- print_float64(sum);
+        _: atom <- println("")
+    produces
+        pure 0
+    end
+}

@@ -1,15 +1,15 @@
-# web-server
+# simple-web-server
 
 A minimal HTTP server in Silica. It listens on `127.0.0.1:5173` and answers every request with `Hello Web Server`.
 
 ```console
-$ silica run silica-examples/web-server
+$ silica run simple-web-server
     Building libsilica_sockets.a
-   Compiling web-server (3 modules) with silica-999921-macos-applesilicon
-  Assembling web-server
-     Linking web-server
-    Finished silica-examples/web-server/.silica-build/web-server/web-server
-     Running silica-examples/web-server/.silica-build/web-server/web-server
+   Compiling simple-web-server (3 modules) with silica-999921-macos-applesilicon
+  Assembling simple-web-server
+     Linking simple-web-server
+    Finished simple-web-server/.silica-build/simple-web-server/simple-web-server
+     Running simple-web-server/.silica-build/simple-web-server/simple-web-server
 Hello Web Server listening on 127.0.0.1, port:5173
 ```
 
