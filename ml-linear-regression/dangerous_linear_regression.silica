@@ -1,0 +1,516 @@
+// Linear regression on a CSV file: fit y = slope * x + intercept by ordinary least squares, then
+// report how well the line fits and use it to predict.
+//
+//   $ python3 ml-linear-regression/csv_to_sildat.py
+//   $ silica run ml-linear-regression
+//   records in the log: 1001
+//   skipped record 0 (not two numbers): hours_studied,exam_score
+//   rows used:     1000
+//   rows skipped:  1
+//   slope:         6.009379762140492
+//   intercept:     44.956357668427088
+//   r squared:     0.968176774349285
+//   model:         y = 6.009379762140492 * x + 44.956357668427088
+//   predict x = 9.300000000000000: 100.843589456333674
+//
+// Silica has no files, paths or directories. A program keeps and reads data only through a STORAGE
+// CARRIER (transport_serialization_design.md §6.8): a `(:store)` declaration below, whose
+// `(:backing, path, capacity, retention)` link is the only place a host path appears. The backing is
+// an append-only log of records, so the CSV is put into that form first by csv_to_sildat.py, one
+// stored value per line: the line as a string, encoded with (:etf), wrapped by wireframe@record and
+// framed for the :storage boundaries.
+//
+// The program then:
+//   1. starts the carrier with spawn_dangerous_carrier and opens it; the carrier recovers the log and
+//      answers (:link_up, info) and (:log, oldest, next, capacity);
+//   2. asks for a replay with (:read, oldest) and a receive window of credit;
+//   3. for every (:rx, segment): unframes it, unrecords it, DECODES it (the bytes of a record are
+//      untrusted until decode re-creates the value, §6.8.3), parses the line as two numbers and adds
+//      it to six running sums, then hands the carrier one more credit;
+//   4. on (:rx_end, next): solves for the line from the sums, prints it and sends :close;
+//   5. on (:link_down, :closed): ends the program.
+//
+// Only the sums are kept, never the rows, so memory stays flat however long the file is: a stream
+// of values, which is how §6.8 means large data to be read.
+//
+// The module is named dangerous_ because it starts a (:backing) carrier, a dangerous actor over the
+// standard library's C store wrapper (E4021).
+module dangerous_linear_regression;
+
+use wireframe;
+use Carrier;
+use storelog;
+use wire_etf;
+use dangerous_store;
+use dangerous_store_backing_carrier;
+
+// A backing path is relative to the directory the program runs in. `dataset` is the path from the
+// silica-examples root (`silica run ml-linear-regression`); `dataset_here` is the same file from
+// inside the project folder (`silica run .`). The program opens `dataset` first and falls back to
+// `dataset_here` when that path does not resolve (on_link_down). The capacity must match
+// csv_to_sildat.py's CAPACITY.
+carried_on dataset: (:store) (:backing, "ml-linear-regression/__ignore__data.sildat", 67108864, :stop);
+carried_on dataset_here: (:store) (:backing, "__ignore__data.sildat", 67108864, :stop);
+
+// How many replayed records may be in flight to the owner at once.
+fn window() -> int64 {
+    8
+}
+
+// The schema version csv_to_sildat.py stores lines under.
+fn line_schema() -> int64 {
+    1
+}
+
+// The x at which the fitted line is used to predict.
+fn predict_at() -> float64 {
+    9.3
+}
+
+// ---------------------------------------------------------------------------------------------
+// Parsing one CSV line, "x,y", into two float64 values. byte_at is a transport operation, so it is
+// called inside a sequence that declares `transport` and the parser itself stays pure.
+
+fn at(s: string, i: int64) -> int64 {
+    sequence proc[transport]
+        b: int64 <- byte_at(s, i)
+    produces
+        pure b
+    end
+}
+
+// Silica has no integer-to-float conversion, so a digit becomes a float64 by table.
+fn digit(d: int64) -> float64 {
+    case d of {
+        0 -> 0.0;
+        1 -> 1.0;
+        2 -> 2.0;
+        3 -> 3.0;
+        4 -> 4.0;
+        5 -> 5.0;
+        6 -> 6.0;
+        7 -> 7.0;
+        8 -> 8.0;
+        9 -> 9.0;
+        _: int64 -> 0.0
+    }
+}
+
+fn is_blank(b: int64) -> boolean {
+    b == 32 or b == 9 or b == 13
+}
+
+// The index of the first comma at or after i, or -1.
+fn comma(s: string, i: int64, n: int64) -> int64 {
+    case i >= n of {
+        true -> 0 - 1;
+        false -> case at(s, i) == 44 of {
+            true -> i;
+            false -> comma(s, i + 1, n)
+        }
+    }
+}
+
+fn skip_blanks(s: string, i: int64, e: int64) -> int64 {
+    case i < e of {
+        true -> case is_blank(at(s, i)) of { true -> skip_blanks(s, i + 1, e); false -> i };
+        false -> i
+    }
+}
+
+fn trim_blanks(s: string, i: int64, e: int64) -> int64 {
+    case e > i of {
+        true -> case is_blank(at(s, e - 1)) of { true -> trim_blanks(s, i, e - 1); false -> e };
+        false -> e
+    }
+}
+
+// A decimal number in s[i, e): an optional '-', digits, and an optional '.' followed by digits.
+fn number(s: string, i: int64, e: int64) -> (:ok, float64) | :bad {
+    a: int64 <- skip_blanks(s, i, e);
+    b: int64 <- trim_blanks(s, a, e);
+    case a < b of {
+        false -> :bad;
+        true -> case at(s, a) == 45 of {
+            true -> negated(digits(s, a + 1, b, 0.0, false, 1.0, 0));
+            false -> digits(s, a, b, 0.0, false, 1.0, 0)
+        }
+    }
+}
+
+fn negated(r: (:ok, float64) | :bad) -> (:ok, float64) | :bad {
+    case r of {
+        (:ok, v: float64) -> (:ok, 0.0 - v);
+        :bad -> :bad
+    }
+}
+
+// acc is the value so far; after the '.', scale is the place value of the next digit.
+fn digits(s: string, i: int64, e: int64, acc: float64, frac: boolean, scale: float64, seen: int64) -> (:ok, float64) | :bad {
+    case i >= e of {
+        true -> case seen > 0 of { true -> (:ok, acc); false -> :bad };
+        false -> {
+            c: int64 <- at(s, i);
+            case c == 46 of {
+                true -> case frac of {
+                    true -> :bad;
+                    false -> digits(s, i + 1, e, acc, true, 1.0, seen)
+                };
+                false -> case c >= 48 and c <= 57 of {
+                    false -> :bad;
+                    true -> case frac of {
+                        true -> digits(s, i + 1, e, acc + digit(c - 48) * (scale / 10.0), true, scale / 10.0, seen + 1);
+                        false -> digits(s, i + 1, e, acc * 10.0 + digit(c - 48), false, scale, seen + 1)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// A line of exactly two numbers; anything else (the header, a bad row) is not a row.
+fn csv_row(line: string) -> (:row, float64, float64) | :not_a_row {
+    n: int64 <- length_bytes(line);
+    c: int64 <- comma(line, 0, n);
+    case c < 0 of {
+        true -> :not_a_row;
+        false -> both(number(line, 0, c), number(line, c + 1, n))
+    }
+}
+
+fn both(x: (:ok, float64) | :bad, y: (:ok, float64) | :bad) -> (:row, float64, float64) | :not_a_row {
+    case x of {
+        :bad -> :not_a_row;
+        (:ok, xv: float64) -> case y of {
+            :bad -> :not_a_row;
+            (:ok, yv: float64) -> (:row, xv, yv)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// From a stored frame to a line of text: take off the record header, check the format and schema,
+// and decode. decode re-creates the string from untrusted bytes, or rejects them.
+
+fn line_of(frame: string) -> (:line, string) | (:unreadable, atom) {
+    case wireframe@unrecord(frame) of {
+        (:rejected, why: atom) -> (:unreadable, why);
+        (:ok, format: atom, schema: int64, body: string) -> case format == :etf and schema == line_schema() of {
+            false -> (:unreadable, :unknown_schema);
+            true -> decoded(body)
+        }
+    }
+}
+
+fn decoded(body: string) -> (:line, string) | (:unreadable, atom) {
+    sequence proc[mem(normal), transport]
+        r: (:ok, string) | (:rejected, atom) <- decode((:etf), body, { max_bytes: 4096 })
+    produces
+        pure case r of {
+            (:ok, line: string) -> (:line, line);
+            (:rejected, why: atom) -> (:unreadable, why)
+        }
+    end
+}
+
+// ---------------------------------------------------------------------------------------------
+// The running sums of least squares. n is a float64 too, counted by adding 1.0, so that every term
+// of the solution is float64 arithmetic.
+
+fn no_sums() -> { n: float64, sx: float64, sy: float64, sxy: float64, sxx: float64, syy: float64 } {
+    { n: 0.0, sx: 0.0, sy: 0.0, sxy: 0.0, sxx: 0.0, syy: 0.0 }
+}
+
+fn add_point(s: { n: float64, sx: float64, sy: float64, sxy: float64, sxx: float64, syy: float64 }, x: float64, y: float64) -> { n: float64, sx: float64, sy: float64, sxy: float64, sxx: float64, syy: float64 } {
+    // Each field is bound first and the record built from the bindings. Written inline, as
+    // { sx: s.sx + x, sy: s.sy + y, ... }, the current compiler gives a float64 field the value of the
+    // field before it instead of reading the parameter (a known compiler bug; see README).
+    n: float64 <- s.n + 1.0;
+    sx: float64 <- s.sx + x;
+    sy: float64 <- s.sy + y;
+    sxy: float64 <- s.sxy + x * y;
+    sxx: float64 <- s.sxx + x * x;
+    syy: float64 <- s.syy + y * y;
+    { n: n, sx: sx, sy: sy, sxy: sxy, sxx: sxx, syy: syy }
+}
+
+// slope     = (n Sxy - Sx Sy) / (n Sxx - Sx^2)
+// intercept = (Sy - slope Sx) / n
+// r^2       = (n Sxy - Sx Sy)^2 / ((n Sxx - Sx^2) (n Syy - Sy^2))
+fn report(s: { n: float64, sx: float64, sy: float64, sxy: float64, sxx: float64, syy: float64 }, rows: int64, skipped: int64) -> atom {
+    _: atom <- say_n("rows used:     ", rows);
+    _: atom <- say_n("rows skipped:  ", skipped);
+    case rows < 2 or s.n * s.sxx - s.sx * s.sx <= 0.0 of {
+        true -> say("cannot fit a line: need at least two rows with different x values");
+        false -> fitted(s)
+    }
+}
+
+// fitted takes the sums and binds its values before the sequence block, rather than taking slope,
+// intercept and r^2 as three float64 parameters: with the current compiler, the third float64
+// parameter of a function reads 0.0 inside a sequence block once other calls have run (a known
+// compiler bug; see README).
+fn fitted(s: { n: float64, sx: float64, sy: float64, sxy: float64, sxx: float64, syy: float64 }) -> atom {
+    cov: float64 <- s.n * s.sxy - s.sx * s.sy;
+    varx: float64 <- s.n * s.sxx - s.sx * s.sx;
+    vary: float64 <- s.n * s.syy - s.sy * s.sy;
+    slope: float64 <- cov / varx;
+    intercept: float64 <- (s.sy - slope * s.sx) / s.n;
+    r2: float64 <- r_squared(cov, varx, vary);
+    prediction: float64 <- slope * predict_at() + intercept;
+    sequence proc[device_io]
+        _: atom <- say_f("slope:         ", slope);
+        _: atom <- say_f("intercept:     ", intercept);
+        _: atom <- say_f("r squared:     ", r2);
+        _: atom <- print("model:         y = ");
+        _: atom <- print_float64(slope);
+        _: atom <- print(" * x + ");
+        _: atom <- print_float64(intercept);
+        _: atom <- println("");
+        _: atom <- print("predict x = ");
+        _: atom <- print_float64(predict_at());
+        _: atom <- print(": ");
+        _: atom <- print_float64(prediction);
+        o: atom <- println("")
+    produces
+        pure o
+    end
+}
+
+// A perfect fit to constant y has no variance to explain; call it 1.
+fn r_squared(cov: float64, varx: float64, vary: float64) -> float64 {
+    case vary <= 0.0 of {
+        true -> 1.0;
+        false -> cov * cov / (varx * vary)
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Printing.
+
+fn say(s: string) -> atom {
+    sequence proc[device_io]
+        o: atom <- println(s)
+    produces
+        pure o
+    end
+}
+
+fn say_n(label: string, n: int64) -> atom {
+    sequence proc[device_io]
+        _: atom <- print(label);
+        _: atom <- print_int64(n);
+        o: atom <- println("")
+    produces
+        pure o
+    end
+}
+
+fn say_f(label: string, v: float64) -> atom {
+    sequence proc[device_io]
+        _: atom <- print(label);
+        _: atom <- print_float64(v);
+        o: atom <- println("")
+    produces
+        pure o
+    end
+}
+
+fn say_atom(label: string, a: atom) -> atom {
+    sequence proc[device_io]
+        _: atom <- print(label);
+        _: atom <- print_atom(a);
+        o: atom <- println("")
+    produces
+        pure o
+    end
+}
+
+fn say_skipped(record: int64, line: string) -> atom {
+    sequence proc[device_io]
+        _: atom <- print("skipped record ");
+        _: atom <- print_int64(record);
+        _: atom <- print(" (not two numbers): ");
+        o: atom <- println(line)
+    produces
+        pure o
+    end
+}
+
+// ---------------------------------------------------------------------------------------------
+// Talking to the carrier.
+
+fn tell(car: dangerous_actor_ref, m: :close | (:read, int64) | (:credit, int64)) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast(car, m impl ActorMessage {})
+    produces
+        pure r
+    end
+}
+
+fn replay(car: dangerous_actor_ref, from: int64) -> boolean {
+    _: boolean <- tell(car, (:read, from));
+    tell(car, (:credit, window()))
+}
+
+fn stop(code: int64) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast_exit(code)
+    produces
+        pure r
+    end
+}
+
+// ---------------------------------------------------------------------------------------------
+// The owner: one actor that receives everything the carrier sends. Its state is the carrier, the
+// reassembly state of the :storage framing, the number of the next record, the counts and the sums.
+
+fn on_log(oldest: int64, nx: int64, st: { car: dangerous_actor_ref, fallback: int64, rx: { mode: atom, expected: int64, pending: string }, record: int64, rows: int64, skipped: int64, sums: { n: float64, sx: float64, sy: float64, sxy: float64, sxx: float64, syy: float64 } }) -> { car: dangerous_actor_ref, fallback: int64, rx: { mode: atom, expected: int64, pending: string }, record: int64, rows: int64, skipped: int64, sums: { n: float64, sx: float64, sy: float64, sxy: float64, sxx: float64, syy: float64 } } {
+    case nx <= oldest of {
+        true -> {
+            _: atom <- say("the log is empty: run `python3 ml-linear-regression/csv_to_sildat.py` first");
+            _: boolean <- tell(st.car, :close);
+            st
+        };
+        false -> {
+            _: atom <- say_n("records in the log: ", nx - oldest);
+            _: boolean <- replay(st.car, oldest);
+            { car: st.car, fallback: st.fallback, rx: st.rx, record: oldest, rows: st.rows, skipped: st.skipped, sums: st.sums }
+        }
+    }
+}
+
+// One replayed record. A line that fits in one record is one whole frame, but the :storage framing
+// is still followed, so a value split across records would be put back together here.
+fn on_rx(segment: string, st: { car: dangerous_actor_ref, fallback: int64, rx: { mode: atom, expected: int64, pending: string }, record: int64, rows: int64, skipped: int64, sums: { n: float64, sx: float64, sy: float64, sxy: float64, sxx: float64, syy: float64 } }) -> { car: dangerous_actor_ref, fallback: int64, rx: { mode: atom, expected: int64, pending: string }, record: int64, rows: int64, skipped: int64, sums: { n: float64, sx: float64, sy: float64, sxy: float64, sxx: float64, syy: float64 } } {
+    _: boolean <- tell(st.car, (:credit, 1));
+    case wireframe@unframe(st.rx, segment, 4096) of {
+        (:more, rx1: { mode: atom, expected: int64, pending: string }) -> { car: st.car, fallback: st.fallback, rx: rx1, record: st.record + 1, rows: st.rows, skipped: st.skipped, sums: st.sums };
+        (:frame, f: string, rx2: { mode: atom, expected: int64, pending: string }) -> on_line(line_of(f), { car: st.car, fallback: st.fallback, rx: rx2, record: st.record, rows: st.rows, skipped: st.skipped, sums: st.sums });
+        (:rejected, why: atom) -> {
+            _: atom <- say_atom("unframe rejected a record: ", why);
+            { car: st.car, fallback: st.fallback, rx: wireframe@fresh(:storage), record: st.record + 1, rows: st.rows, skipped: st.skipped + 1, sums: st.sums }
+        }
+    }
+}
+
+fn on_line(l: (:line, string) | (:unreadable, atom), st: { car: dangerous_actor_ref, fallback: int64, rx: { mode: atom, expected: int64, pending: string }, record: int64, rows: int64, skipped: int64, sums: { n: float64, sx: float64, sy: float64, sxy: float64, sxx: float64, syy: float64 } }) -> { car: dangerous_actor_ref, fallback: int64, rx: { mode: atom, expected: int64, pending: string }, record: int64, rows: int64, skipped: int64, sums: { n: float64, sx: float64, sy: float64, sxy: float64, sxx: float64, syy: float64 } } {
+    case l of {
+        (:unreadable, why: atom) -> {
+            _: atom <- say_atom("unreadable record: ", why);
+            { car: st.car, fallback: st.fallback, rx: st.rx, record: st.record + 1, rows: st.rows, skipped: st.skipped + 1, sums: st.sums }
+        };
+        (:line, text: string) -> case csv_row(text) of {
+            (:row, x: float64, y: float64) -> { car: st.car, fallback: st.fallback, rx: st.rx, record: st.record + 1, rows: st.rows + 1, skipped: st.skipped, sums: add_point(st.sums, x, y) };
+            :not_a_row -> {
+                _: atom <- say_skipped(st.record, text);
+                { car: st.car, fallback: st.fallback, rx: st.rx, record: st.record + 1, rows: st.rows, skipped: st.skipped + 1, sums: st.sums }
+            }
+        }
+    }
+}
+
+// A line every 100,000 records, so a long replay shows it is moving.
+fn progress(st: { car: dangerous_actor_ref, fallback: int64, rx: { mode: atom, expected: int64, pending: string }, record: int64, rows: int64, skipped: int64, sums: { n: float64, sx: float64, sy: float64, sxy: float64, sxx: float64, syy: float64 } }) -> { car: dangerous_actor_ref, fallback: int64, rx: { mode: atom, expected: int64, pending: string }, record: int64, rows: int64, skipped: int64, sums: { n: float64, sx: float64, sy: float64, sxy: float64, sxx: float64, syy: float64 } } {
+    case st.record > 0 and st.record % 100000 == 0 of {
+        true -> {
+            _: atom <- say_n("  replayed ", st.record);
+            st
+        };
+        false -> st
+    }
+}
+
+fn on_rx_end(st: { car: dangerous_actor_ref, fallback: int64, rx: { mode: atom, expected: int64, pending: string }, record: int64, rows: int64, skipped: int64, sums: { n: float64, sx: float64, sy: float64, sxy: float64, sxx: float64, syy: float64 } }) -> { car: dangerous_actor_ref, fallback: int64, rx: { mode: atom, expected: int64, pending: string }, record: int64, rows: int64, skipped: int64, sums: { n: float64, sx: float64, sy: float64, sxy: float64, sxx: float64, syy: float64 } } {
+    _: atom <- report(st.sums, st.rows, st.skipped);
+    _: boolean <- tell(st.car, :close);
+    st
+}
+
+fn on_failed(label: string, why: atom, st: { car: dangerous_actor_ref, fallback: int64, rx: { mode: atom, expected: int64, pending: string }, record: int64, rows: int64, skipped: int64, sums: { n: float64, sx: float64, sy: float64, sxy: float64, sxx: float64, syy: float64 } }) -> { car: dangerous_actor_ref, fallback: int64, rx: { mode: atom, expected: int64, pending: string }, record: int64, rows: int64, skipped: int64, sums: { n: float64, sx: float64, sy: float64, sxy: float64, sxx: float64, syy: float64 } } {
+    _: atom <- say_atom(label, why);
+    _: boolean <- tell(st.car, :close);
+    st
+}
+
+// fallback says which declaration the owner is on: 0 the first (`dataset`), 1 the second
+// (`dataset_here`) with the first carrier's (:link_down, :closed) still to come, 2 the second with
+// that message already seen.
+//
+// :medium from the first carrier means its path did not resolve: the program was started somewhere
+// other than the silica-examples root, most likely inside the project folder. That carrier is closed
+// (a carrier whose open failed stays until :close, §6.8.2, and answers it with (:link_down,
+// :closed)), and a second carrier opens `dataset_here`. The first carrier's :closed is skipped; any
+// other :closed is the end of a normal run. Any other failure is reported, the carrier is closed and
+// the program ends with status 1.
+fn on_link_down(why: atom, st: { car: dangerous_actor_ref, fallback: int64, rx: { mode: atom, expected: int64, pending: string }, record: int64, rows: int64, skipped: int64, sums: { n: float64, sx: float64, sy: float64, sxy: float64, sxx: float64, syy: float64 } }) -> { car: dangerous_actor_ref, fallback: int64, rx: { mode: atom, expected: int64, pending: string }, record: int64, rows: int64, skipped: int64, sums: { n: float64, sx: float64, sy: float64, sxy: float64, sxx: float64, syy: float64 } } {
+    case why == :closed of {
+        true -> case st.fallback == 1 of {
+            true -> { car: st.car, fallback: 2, rx: st.rx, record: st.record, rows: st.rows, skipped: st.skipped, sums: st.sums };
+            false -> {
+                _: boolean <- stop(0);
+                st
+            }
+        };
+        false -> case why == :medium and st.fallback == 0 of {
+            true -> {
+                _: boolean <- tell(st.car, :close);
+                { car: open_here(), fallback: 1, rx: st.rx, record: st.record, rows: st.rows, skipped: st.skipped, sums: st.sums }
+            };
+            false -> {
+                _: atom <- say_atom("the store could not be opened: ", why);
+                _: boolean <- tell(st.car, :close);
+                _: boolean <- stop(1);
+                st
+            }
+        }
+    }
+}
+
+// A carrier on `dataset_here`, opened with this actor as its owner.
+fn open_here() -> dangerous_actor_ref {
+    sequence proc[concurrency]
+        car: dangerous_actor_ref <- spawn_dangerous_carrier(dataset_here, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: boolean <- cast(car, (:open, self(), "") impl ActorMessage {})
+    produces
+        pure car
+    end
+}
+
+fn owner(msg: (:link_up, string) | (:log, int64, int64, int64) | (:tx_credit, int64) | (:synced, int64) | (:rx, string) | (:rx_end, int64) | (:tx_failed, atom) | (:read_failed, atom) | (:link_down, atom), state: { car: dangerous_actor_ref, fallback: int64, rx: { mode: atom, expected: int64, pending: string }, record: int64, rows: int64, skipped: int64, sums: { n: float64, sx: float64, sy: float64, sxy: float64, sxx: float64, syy: float64 } }) -> (:no_reply, { car: dangerous_actor_ref, fallback: int64, rx: { mode: atom, expected: int64, pending: string }, record: int64, rows: int64, skipped: int64, sums: { n: float64, sx: float64, sy: float64, sxy: float64, sxx: float64, syy: float64 } }) {
+    case msg of {
+        (:link_up, _info: string) -> (:no_reply, state);
+        (:log, oldest: int64, nx: int64, _capacity: int64) -> (:no_reply, on_log(oldest, nx, state));
+        (:tx_credit, _n: int64) -> (:no_reply, state);
+        (:synced, _s: int64) -> (:no_reply, state);
+        (:rx, segment: string) -> (:no_reply, progress(on_rx(segment, state)));
+        (:rx_end, _next: int64) -> (:no_reply, on_rx_end(state));
+        (:tx_failed, _why: atom) -> (:no_reply, state);
+        (:read_failed, why: atom) -> (:no_reply, on_failed("the replay failed: ", why, state));
+        (:link_down, why: atom) -> (:no_reply, on_link_down(why, state))
+    }
+}
+
+// How many memory regions to dump when an actor fails (none here).
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// The compiler requires every program that spawns actors to register a failure reporter first
+// (spec §15.4.13.4). This one counts the reports and ignores them.
+fn reporter(_report: string, state: int64) -> (:no_reply, int64) {
+    (:no_reply, state + 1)
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        rep: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: atom <- register_failure_reporter(rep);
+        car: dangerous_actor_ref <- spawn_dangerous_carrier(dataset, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        own: actor_ref <- spawn({ car: car, fallback: 0, rx: wireframe@fresh(:storage), record: 0, rows: 0, skipped: 0, sums: no_sums() }, owner, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: boolean <- cast(car, (:open, own, "") impl ActorMessage {});
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

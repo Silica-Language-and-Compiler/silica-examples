@@ -14,9 +14,14 @@ silica.shapes
 silica.link
 __silica_runtime.*
 
+# Silica storage backings (generated, e.g. by ml-linear-regression/csv_to_sildat.py)
+*.sildat
+
 # Editors and OS
 .DS_Store
 .vscode/
 .idea/
 *.swp
 *~
+
+*__ignore*
