@@ -91,6 +91,22 @@ $ silica run read-log-file
 
 See [`simple-web-server/README.md`](simple-web-server/README.md) and [`web-server-from-static-files/README.md`](web-server-from-static-files/README.md) for how they work.
 
+## Adding an example
+
+Each pull request builds, runs and checks every example on macOS (Apple Silicon), Linux on AArch64 and Linux on x86-64. It uses the latest `silica` CLI and the latest released compiler ([`.github/workflows/examples.yml`](.github/workflows/examples.yml)). Any top-level folder with a `.silica` file in it counts as an example, so a new one is picked up without changing the workflow. An example passes when:
+
+1. `silica build <folder>` succeeds, and
+2. `silica run <folder>` exits with status 0 or 2 (`:ok`) within 3 minutes.
+
+If an example needs setup first, never exits on its own (like a server), or prints output worth checking, add a `ci.sh` to its folder. It then runs in place of step 2, with `bash` from the repository root, and it must exit 0. Anything it leaves running is stopped afterwards. See [`read-log-file/ci.sh`](read-log-file/ci.sh) and [`simple-web-server/ci.sh`](simple-web-server/ci.sh) for examples.
+
+To run the same checks locally, from the repository root:
+
+```console
+$ .github/scripts/run-examples.sh                 # every example
+$ .github/scripts/run-examples.sh hello-world     # just this one
+```
+
 ## Learn more
 
 - `silica spec` shows where the language specification is installed and how to search it
