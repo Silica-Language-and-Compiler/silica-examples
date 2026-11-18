@@ -17,6 +17,7 @@ Small, runnable programs written in [Silica](https://github.com/Silica-Language-
 | [`web-server-from-static-files`](web-server-from-static-files/) | An HTTP server that keeps its files in a Silica store (`(:store)` carrier, `site.sildat`): `PUT` stores a file, `GET` streams it back in chunks |
 | [`ml-linear-regression`](ml-linear-regression/) | Least-squares linear regression over a CSV file, replayed from a `(:store)` storage carrier: records unframed, `decode`d and parsed, with flat memory however long the file is |
 | [`read-log-file`](read-log-file/) | Reading a text log through a `(:store)` storage carrier and printing its `[ERROR]` rows, with a byte-level parser and per-level counts |
+| [`local-persistence`](local-persistence/) | A log that survives between runs: each run appends to a `(:store)` carrier on a `(:backing)` file, syncs it to disk and replays everything stored so far |
 
 The games play themselves: the language doesn't read from standard input yet, so there is no keyboard input. `dice-race` compiles with warning W2300, which says the referee's state is copied after every message. That's fine at this size.
 
@@ -85,6 +86,8 @@ $ silica run ml-linear-regression
 $ silica sildat read-log-file/app.log read-log-file/__ignore__app.sildat --capacity 1048576
 $ silica run read-log-file
 ```
+
+`local-persistence` creates its own log file on the first run, so there is nothing to convert. Run it a few times to watch the log grow, and delete `local-persistence/__ignore__journal.sildat` to start over.
 
 See [`simple-web-server/README.md`](simple-web-server/README.md) and [`web-server-from-static-files/README.md`](web-server-from-static-files/README.md) for how they work.
 
