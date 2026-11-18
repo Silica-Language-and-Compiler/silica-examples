@@ -1,0 +1,150 @@
+// Self-healing workers: a supervisor keeps three workers alive while poisoned jobs crash them.
+//
+// A driver actor hands out twelve jobs one at a time, round-robin over the workers w1, w2 and w3.
+// A job is the number its worker divides 1000 by. Three of the jobs are 0, so the worker divides by
+// zero and crashes ("let it crash"). The Supervisor restarts the crashed worker under its :permanent
+// policy, a FailureReporter prints each crash report to standard error, and the supervisor's report
+// sink tells the driver the restart is done so it can send the next job. When every job has either
+// completed or crashed, the driver prints a summary and ends the program.
+//
+//   silica run self-healing-workers
+
+use Supervisor;
+
+impl WorkerPool for Supervisor;
+
+// How many jobs the driver hands out.
+fn total_jobs() -> int64 {
+    12
+}
+
+// The value of job i. Jobs 2, 5 and 9 are poisoned: dividing by 0 crashes the worker.
+fn job(i: int64) -> int64 {
+    case i of {
+        2 -> 0;
+        5 -> 0;
+        9 -> 0;
+        _: int64 -> i + 3
+    }
+}
+
+// The worker that gets job i, round-robin. Children are registered under these ids.
+fn worker_name(i: int64) -> atom {
+    case i % 3 of {
+        0 -> :w1;
+        1 -> :w2;
+        _: int64 -> :w3
+    }
+}
+
+// The supervisor's children: three permanent workers. A worker's state is its number.
+fn init(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous, state_policy: state_policy }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_one, allowed_restart_count: 10, restarts_time_frame: 60 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous, state_policy: state_policy }, mem(normal)] <- [
+            { id: :w1, agent_type: :worker, initial_state: initial_state, behavior: worker, restart: :permanent, shutdown: 0, flavor: :plain, state_policy: state_policy(:keep_state_area) },
+            { id: :w2, agent_type: :worker, initial_state: initial_state + 1, behavior: worker, restart: :permanent, shutdown: 0, flavor: :plain, state_policy: state_policy(:keep_state_area) },
+            { id: :w3, agent_type: :worker, initial_state: initial_state + 2, behavior: worker, restart: :permanent, shutdown: 0, flavor: :plain, state_policy: state_policy(:keep_state_area) }
+        ]
+    produces pure (flags, children) end
+}
+
+// A worker divides 1000 by the job. Job 0 is a division by zero, which crashes the worker. Otherwise
+// it prints the result and tells the driver the job is done (event 1).
+fn worker(msg: int64, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        result: int64 <- 1000 / msg;
+        _: atom <- print("worker ");
+        _: atom <- print_int64(state);
+        _: atom <- print(": 1000 / ");
+        _: atom <- print_int64(msg);
+        _: atom <- print(" = ");
+        _: atom <- print_int64(result);
+        _: atom <- println("");
+        _: boolean <- cast_registered(:driver, 1 impl ActorMessage {})
+    produces pure (:no_reply, state) end
+}
+
+// 1 when the event is the given code, else 0.
+fn bump(ev: int64, code: int64) -> int64 {
+    case ev == code of {
+        true -> 1;
+        false -> 0
+    }
+}
+
+// The final summary; ends the program with status 0.
+fn finish(done: int64, crashes: int64, restarts: int64) -> boolean {
+    sequence proc[concurrency, device_io]
+        _: atom <- print("summary: jobs_completed=");
+        _: atom <- print_int64(done);
+        _: atom <- print(" crashes=");
+        _: atom <- print_int64(crashes);
+        _: atom <- print(" restarts=");
+        _: atom <- print_int64(restarts);
+        _: atom <- println("");
+        ended: boolean <- cast_exit(0)
+    produces pure ended end
+}
+
+// The driver. Events: 0 start, 1 a worker finished a job, 2 a worker crashed and was restarted,
+// 3 a worker crashed and was not restarted. Each event is the outcome of the previous job (or the
+// start), so exactly one job is in flight at a time and the next one is sent only when the crashed
+// worker's name is registered again.
+fn driver(ev: int64, s: { next: int64, done: int64, crashes: int64, restarts: int64 }) -> (:no_reply, { next: int64, done: int64, crashes: int64, restarts: int64 }) {
+    sequence proc[concurrency]
+        done: int64 <- s.done + bump(ev, 1);
+        crashes: int64 <- s.crashes + bump(ev, 2) + bump(ev, 3);
+        restarts: int64 <- s.restarts + bump(ev, 2);
+        target: atom <- worker_name(s.next);
+        value: int64 <- job(s.next);
+        _: boolean <- case done + crashes == total_jobs() of {
+            true -> finish(done, crashes, restarts);
+            false -> cast_registered(target, value impl ActorMessage {})
+        }
+    produces pure (:no_reply, { next: s.next + 1, done: done, crashes: crashes, restarts: restarts }) end
+}
+
+// The supervisor's report sink (spec §15.4.10.5): one exit_report per child death, sent after the
+// restart. It tells the driver whether the worker came back (event 2) or not (event 3).
+fn sink(r: { child: actor_ref, child_id: atom, failure_reason: :normal | :language_error | :memory_fault | (:explicit, atom) | :noproc | :unknown, restarted: boolean, new_child: actor_ref }, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        event: int64 <- case r.restarted of {
+            true -> 2;
+            false -> 3
+        };
+        _: atom <- println("supervisor: a worker crashed");
+        _: boolean <- cast_registered(:driver, event impl ActorMessage {})
+    produces pure (:no_reply, state) end
+}
+
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// The FailureReporter prints every crash report to standard error.
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[device_io]
+        _: atom <- println_stderr(report)
+    produces pure (:no_reply, state) end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        rep: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: atom <- register_failure_reporter(rep);
+        _: actor_ref <- spawn_registered({ next: 0, done: 0, crashes: 0, restarts: 0 }, driver, :driver, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        s: actor_ref <- spawn(0, sink, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        sup: supervisor_ref <- spawn_registered_supervisor(WorkerPool, 1, :pool, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        set: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(sup, { op: :set_report_sink, sink: s } impl SupervisorMessage {});
+        _: atom <- case set.status of {
+            :sink_set -> println("supervisor ready: 3 workers, crash reports go to stderr");
+            _: atom -> println("report sink NOT set")
+        };
+        _: boolean <- cast_registered(:driver, 0 impl ActorMessage {});
+        code: int64 <- wait_for_exit()
+    produces pure code end
+}

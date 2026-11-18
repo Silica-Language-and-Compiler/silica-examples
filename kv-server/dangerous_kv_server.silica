@@ -1,0 +1,716 @@
+// A mini Redis-like key-value server: a line protocol over TCP, with every change kept in a log file
+// that is replayed on start-up, so the data survives a restart.
+//
+//   $ silica run kv-server            (from the silica-examples root)
+//   $ printf 'SET city Oslo\nGET city\nKEYS\nDEL city\nGET city\n' | nc -w 1 127.0.0.1 6380
+//   OK
+//   Oslo
+//   city
+//   OK
+//   (nil)
+//
+// Commands (one per line, upper case): SET <key> <value> | GET <key> | DEL <key> | KEYS.
+// A key has no spaces; a value is the rest of the line. Replies: OK, the value, (nil), the keys
+// separated by spaces ((empty) when there are none), or ERR <reason>.
+//
+// The actors:
+//   - the TCP listener carrier (the standard library's (:tcp) carrier, dangerous_tcp_carrier) on
+//     127.0.0.1:6380, and `server`, its owner, which gives every accepted connection a session;
+//   - one `session` actor per connection: it reassembles lines from the bytes received, parses each
+//     command and asks `owner` for it;
+//   - `owner`: the single actor that holds the data and the only one that touches the log. The data
+//     is one string of "key value" lines (see below). Each SET and DEL is appended to a (:store)
+//     carrier on a (:backing) file, and on start-up the owner replays that log to rebuild the data
+//     before the listener is opened.
+//
+// Why a string and not OrderedMap/wbt_map: the stdlib map is region-typed (OrderedMap[K, V, mem(normal)]
+// with a five-field map record) and is only exercised in trials inside one closure; keeping it in an
+// actor's state across messages is not shown anywhere. The data here is a plain string,
+// "key value\nkey value\n...", searched line by line: fine for an example, linear in the data size.
+//
+// The log holds one record per change: "S <key> <value>" or "D <key>".
+//
+// SECURITY: plain TCP, no authentication, no TLS. The listener binds loopback only.
+//
+// The module is named dangerous_ because it starts a TCP carrier and a (:backing) store carrier,
+// dangerous actors over FFI wrappers (E4021).
+module dangerous_kv_server;
+
+use Carrier;
+use dangerous_store;
+use dangerous_store_backing_carrier;
+use dangerous_tcp_carrier;
+
+// The log: a (:store) on a file, 65536 bytes, retention :stop (a full log refuses appends; the owner
+// reports (:tx_failed, ...) on its console). `journal` is the path from the silica-examples root
+// (`silica run kv-server`); `journal_here` is the same file from inside the project folder
+// (`silica run .`). The owner opens `journal` first and falls back to `journal_here` when that path
+// does not resolve (on_link_down), as in local-persistence.
+carried_on journal: (:store) (:backing, "kv-server/__ignore__kv.sildat", 65536, :stop);
+carried_on journal_here: (:store) (:backing, "__ignore__kv.sildat", 65536, :stop);
+
+fn region_dump_limit() -> int64 {
+    0
+}
+
+fn listen_address() -> string {
+    "listen:6380"
+}
+
+// How many replayed records may be in flight to the owner at once.
+fn window() -> int64 {
+    8
+}
+
+// ---- Printing ----
+
+fn say_text(label: string, s: string) -> atom {
+    sequence proc[device_io]
+        _: atom <- print(label);
+        o: atom <- println(s)
+    produces
+        pure o
+    end
+}
+
+fn say_n(label: string, n: int64) -> atom {
+    sequence proc[device_io]
+        _: atom <- print(label);
+        _: atom <- print_int64(n);
+        o: atom <- println("")
+    produces
+        pure o
+    end
+}
+
+fn say_atom(label: string, a: atom) -> atom {
+    sequence proc[device_io]
+        _: atom <- print(label);
+        _: atom <- print_atom(a);
+        o: atom <- println("")
+    produces
+        pure o
+    end
+}
+
+// ---- Bytes of strings (byte_at and byte_slice are transport operations) ----
+
+fn at(s: string, i: int64) -> int64 {
+    sequence proc[transport]
+        b: int64 <- byte_at(s, i)
+    produces
+        pure b
+    end
+}
+
+// s[a, b) by byte offsets.
+fn slice(s: string, a: int64, b: int64) -> string {
+    sequence proc[mem(normal), transport]
+        r: string <- byte_slice(s, a, b)
+    produces
+        pure r
+    end
+}
+
+// The index of the first byte b at or after i and before n, or -1.
+fn find(s: string, b: int64, i: int64, n: int64) -> int64 {
+    case i >= n of {
+        true -> 0 - 1;
+        false -> case at(s, i) == b of {
+            true -> i;
+            false -> find(s, b, i + 1, n)
+        }
+    }
+}
+
+// ---- The data: one string of "key value\n" lines ----
+
+// The index where the line of key k starts, or -1. Every line is "key", a space, the value, "\n".
+fn locate(db: string, k: string, pos: int64, n: int64) -> int64 {
+    case pos >= n of {
+        true -> 0 - 1;
+        false -> {
+            eol: int64 <- find(db, 10, pos, n);
+            sp: int64 <- find(db, 32, pos, eol);
+            case slice(db, pos, sp) == k of {
+                true -> pos;
+                false -> locate(db, k, eol + 1, n)
+            }
+        }
+    }
+}
+
+// db without the line that starts at p.
+fn remove_at(db: string, p: int64) -> string {
+    n: int64 <- length_bytes(db);
+    eol: int64 <- find(db, 10, p, n);
+    concat(slice(db, 0, p), slice(db, eol + 1, n))
+}
+
+fn delete_key(db: string, k: string) -> string {
+    p: int64 <- locate(db, k, 0, length_bytes(db));
+    case p < 0 of {
+        true -> db;
+        false -> remove_at(db, p)
+    }
+}
+
+// Sets k to v; a key that is set again moves to the end.
+fn put(db: string, k: string, v: string) -> string {
+    base: string <- delete_key(db, k);
+    concat(base, concat(k, concat(" ", concat(v, "\n"))))
+}
+
+fn lookup(db: string, k: string) -> string {
+    p: int64 <- locate(db, k, 0, length_bytes(db));
+    case p < 0 of {
+        true -> "(nil)";
+        false -> {
+            eol: int64 <- find(db, 10, p, length_bytes(db));
+            sp: int64 <- find(db, 32, p, eol);
+            slice(db, sp + 1, eol)
+        }
+    }
+}
+
+fn keys_from(db: string, pos: int64, n: int64, acc: string) -> string {
+    case pos >= n of {
+        true -> acc;
+        false -> {
+            eol: int64 <- find(db, 10, pos, n);
+            sp: int64 <- find(db, 32, pos, eol);
+            k: string <- slice(db, pos, sp);
+            keys_from(db, eol + 1, n, case length_bytes(acc) == 0 of {
+                true -> k;
+                false -> concat(acc, concat(" ", k))
+            })
+        }
+    }
+}
+
+fn key_list(db: string) -> string {
+    ks: string <- keys_from(db, 0, length_bytes(db), "");
+    case length_bytes(ks) == 0 of {
+        true -> "(empty)";
+        false -> ks
+    }
+}
+
+// ---- The log records ----
+
+fn set_record(k: string, v: string) -> string {
+    concat("S ", concat(k, concat(" ", v)))
+}
+
+fn del_record(k: string) -> string {
+    concat("D ", k)
+}
+
+// body is "<key> <value>".
+fn apply_set(db: string, body: string) -> string {
+    bn: int64 <- length_bytes(body);
+    ks: int64 <- find(body, 32, 0, bn);
+    case ks < 1 of {
+        true -> db;
+        false -> put(db, slice(body, 0, ks), slice(body, ks + 1, bn))
+    }
+}
+
+// One replayed record applied to the data. A record that is neither S nor D is skipped.
+fn apply_record(db: string, record: string) -> string {
+    n: int64 <- length_bytes(record);
+    case starts_with(record, "S ") of {
+        true -> apply_set(db, slice(record, 2, n));
+        false -> case starts_with(record, "D ") of {
+            true -> delete_key(db, slice(record, 2, n));
+            false -> db
+        }
+    }
+}
+
+// ---- What the owner asks of the log carrier: every request is a cast ----
+
+fn tx(car: dangerous_actor_ref, s: string) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast(car, (:tx, s, self()) impl ActorMessage {})
+    produces
+        pure r
+    end
+}
+
+fn ask_sync(car: dangerous_actor_ref) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast(car, :sync impl ActorMessage {})
+    produces
+        pure r
+    end
+}
+
+fn ask_read(car: dangerous_actor_ref, start: int64) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast(car, (:read, start) impl ActorMessage {})
+    produces
+        pure r
+    end
+}
+
+fn give_credit(car: dangerous_actor_ref, n: int64) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast(car, (:credit, n) impl ActorMessage {})
+    produces
+        pure r
+    end
+}
+
+fn ask_close(car: dangerous_actor_ref) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast(car, :close impl ActorMessage {})
+    produces
+        pure r
+    end
+}
+
+// Append a record and make it durable.
+fn persist(car: dangerous_actor_ref, record: string) -> boolean {
+    _: boolean <- tx(car, record);
+    ask_sync(car)
+}
+
+fn leave(code: int64) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast_exit(code)
+    produces
+        pure r
+    end
+}
+
+// Open the TCP listener for `srv`: done once the data has been rebuilt from the log.
+fn start_listening(lst: dangerous_actor_ref, srv: actor_ref) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast(lst, (:open, srv, listen_address()) impl ActorMessage {})
+    produces
+        pure r
+    end
+}
+
+// The reply of the owner to a session.
+fn reply(to: actor_ref, text: string) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast(to, (:reply, text) impl ActorMessage {})
+    produces
+        pure r
+    end
+}
+
+// ---- The owner ----
+//
+// State: car (the log carrier), lst (the TCP listener carrier), srv (the listener's owner, set by
+// :attach), fallback (which log declaration is in use, see on_link_down) and db (the data).
+
+fn with_db(st: { car: dangerous_actor_ref, lst: dangerous_actor_ref, srv: actor_ref, fallback: int64, db: string }, db: string)
+    -> { car: dangerous_actor_ref, lst: dangerous_actor_ref, srv: actor_ref, fallback: int64, db: string } {
+    { car: st.car, lst: st.lst, srv: st.srv, fallback: st.fallback, db: db }
+}
+
+fn with_fallback(st: { car: dangerous_actor_ref, lst: dangerous_actor_ref, srv: actor_ref, fallback: int64, db: string }, fallback: int64)
+    -> { car: dangerous_actor_ref, lst: dangerous_actor_ref, srv: actor_ref, fallback: int64, db: string } {
+    { car: st.car, lst: st.lst, srv: st.srv, fallback: fallback, db: st.db }
+}
+
+fn with_srv(st: { car: dangerous_actor_ref, lst: dangerous_actor_ref, srv: actor_ref, fallback: int64, db: string }, srv: actor_ref)
+    -> { car: dangerous_actor_ref, lst: dangerous_actor_ref, srv: actor_ref, fallback: int64, db: string } {
+    { car: st.car, lst: st.lst, srv: srv, fallback: st.fallback, db: st.db }
+}
+
+// The log as the carrier found it. An empty log needs no replay; otherwise replay from the oldest record.
+fn on_log(oldest: int64, nx: int64, st: { car: dangerous_actor_ref, lst: dangerous_actor_ref, srv: actor_ref, fallback: int64, db: string })
+    -> { car: dangerous_actor_ref, lst: dangerous_actor_ref, srv: actor_ref, fallback: int64, db: string } {
+    case nx <= oldest of {
+        true -> {
+            _: atom <- say_text("log is empty: ", "starting with no data");
+            _: boolean <- start_listening(st.lst, st.srv);
+            st
+        };
+        false -> {
+            _: atom <- say_n("replaying log records: ", nx - oldest);
+            _: boolean <- ask_read(st.car, oldest);
+            _: boolean <- give_credit(st.car, window());
+            st
+        }
+    }
+}
+
+fn on_rx(record: string, st: { car: dangerous_actor_ref, lst: dangerous_actor_ref, srv: actor_ref, fallback: int64, db: string })
+    -> { car: dangerous_actor_ref, lst: dangerous_actor_ref, srv: actor_ref, fallback: int64, db: string } {
+    _: boolean <- give_credit(st.car, 1);
+    with_db(st, apply_record(st.db, record))
+}
+
+fn on_rx_end(st: { car: dangerous_actor_ref, lst: dangerous_actor_ref, srv: actor_ref, fallback: int64, db: string })
+    -> { car: dangerous_actor_ref, lst: dangerous_actor_ref, srv: actor_ref, fallback: int64, db: string } {
+    _: atom <- say_n("replay complete, bytes of data restored: ", length_bytes(st.db));
+    _: boolean <- start_listening(st.lst, st.srv);
+    st
+}
+
+fn on_read_failed(why: atom, st: { car: dangerous_actor_ref, lst: dangerous_actor_ref, srv: actor_ref, fallback: int64, db: string })
+    -> { car: dangerous_actor_ref, lst: dangerous_actor_ref, srv: actor_ref, fallback: int64, db: string } {
+    _: atom <- say_atom("the log could not be replayed: ", why);
+    _: boolean <- ask_close(st.car);
+    with_fallback(st, 3)
+}
+
+fn on_set(to: actor_ref, k: string, v: string, st: { car: dangerous_actor_ref, lst: dangerous_actor_ref, srv: actor_ref, fallback: int64, db: string })
+    -> { car: dangerous_actor_ref, lst: dangerous_actor_ref, srv: actor_ref, fallback: int64, db: string } {
+    _: boolean <- persist(st.car, set_record(k, v));
+    _: boolean <- reply(to, "OK");
+    with_db(st, put(st.db, k, v))
+}
+
+fn on_get(to: actor_ref, k: string, st: { car: dangerous_actor_ref, lst: dangerous_actor_ref, srv: actor_ref, fallback: int64, db: string })
+    -> { car: dangerous_actor_ref, lst: dangerous_actor_ref, srv: actor_ref, fallback: int64, db: string } {
+    _: boolean <- reply(to, lookup(st.db, k));
+    st
+}
+
+fn on_del(to: actor_ref, k: string, st: { car: dangerous_actor_ref, lst: dangerous_actor_ref, srv: actor_ref, fallback: int64, db: string })
+    -> { car: dangerous_actor_ref, lst: dangerous_actor_ref, srv: actor_ref, fallback: int64, db: string } {
+    p: int64 <- locate(st.db, k, 0, length_bytes(st.db));
+    case p < 0 of {
+        true -> {
+            _: boolean <- reply(to, "(nil)");
+            st
+        };
+        false -> {
+            _: boolean <- persist(st.car, del_record(k));
+            _: boolean <- reply(to, "OK");
+            with_db(st, remove_at(st.db, p))
+        }
+    }
+}
+
+fn on_keys(to: actor_ref, st: { car: dangerous_actor_ref, lst: dangerous_actor_ref, srv: actor_ref, fallback: int64, db: string })
+    -> { car: dangerous_actor_ref, lst: dangerous_actor_ref, srv: actor_ref, fallback: int64, db: string } {
+    _: boolean <- reply(to, key_list(st.db));
+    st
+}
+
+fn on_bad(to: actor_ref, text: string, st: { car: dangerous_actor_ref, lst: dangerous_actor_ref, srv: actor_ref, fallback: int64, db: string })
+    -> { car: dangerous_actor_ref, lst: dangerous_actor_ref, srv: actor_ref, fallback: int64, db: string } {
+    _: boolean <- reply(to, text);
+    st
+}
+
+// A carrier on `journal_here`, opened with this actor as its owner.
+fn open_here() -> dangerous_actor_ref {
+    sequence proc[concurrency]
+        car: dangerous_actor_ref <- spawn_dangerous_carrier(journal_here, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: boolean <- cast(car, (:open, self(), "") impl ActorMessage {})
+    produces
+        pure car
+    end
+}
+
+// The log carrier's (:link_down, why). fallback: 0 the first declaration (`journal`), 1 the second
+// (`journal_here`) with the first carrier's :closed still to come, 2 the second with that seen,
+// 3 failed: the log could not be opened or read, and the program ends with status 1 once its
+// carrier has closed.
+//
+// :medium from the first carrier means its path did not resolve (the program was started inside the
+// project folder): that carrier is closed and a second one opens `journal_here`. Any other failure
+// is reported and the carrier is closed.
+fn on_link_down(why: atom, st: { car: dangerous_actor_ref, lst: dangerous_actor_ref, srv: actor_ref, fallback: int64, db: string })
+    -> { car: dangerous_actor_ref, lst: dangerous_actor_ref, srv: actor_ref, fallback: int64, db: string } {
+    case why == :closed of {
+        true -> case st.fallback == 1 of {
+            true -> with_fallback(st, 2);
+            false -> case st.fallback == 3 of {
+                true -> {
+                    _: boolean <- leave(1);
+                    st
+                };
+                false -> {
+                    _: boolean <- leave(0);
+                    st
+                }
+            }
+        };
+        false -> case why == :medium and st.fallback == 0 of {
+            true -> {
+                _: boolean <- ask_close(st.car);
+                { car: open_here(), lst: st.lst, srv: st.srv, fallback: 1, db: st.db }
+            };
+            false -> {
+                _: atom <- say_atom("the log could not be opened: ", why);
+                _: boolean <- ask_close(st.car);
+                with_fallback(st, 3)
+            }
+        }
+    }
+}
+
+// The owner: the log carrier's owner and the target of every session's requests.
+fn owner(msg: (:link_up, string) | (:log, int64, int64, int64) | (:tx_credit, int64) | (:synced, int64) | (:rx, string) | (:rx_end, int64) | (:tx_failed, atom) | (:read_failed, atom) | (:link_down, atom) | (:attach, actor_ref) | (:set, actor_ref, string, string) | (:get, actor_ref, string) | (:del, actor_ref, string) | (:keys, actor_ref) | (:bad, actor_ref, string),
+         st: { car: dangerous_actor_ref, lst: dangerous_actor_ref, srv: actor_ref, fallback: int64, db: string })
+    -> (:no_reply, { car: dangerous_actor_ref, lst: dangerous_actor_ref, srv: actor_ref, fallback: int64, db: string }) {
+    case msg of {
+        (:link_up, _info: string) -> (:no_reply, st);
+        (:log, oldest: int64, nx: int64, _capacity: int64) -> (:no_reply, on_log(oldest, nx, st));
+        (:tx_credit, _n: int64) -> (:no_reply, st);
+        (:synced, _s: int64) -> (:no_reply, st);
+        (:rx, record: string) -> (:no_reply, on_rx(record, st));
+        (:rx_end, _next: int64) -> (:no_reply, on_rx_end(st));
+        (:tx_failed, why: atom) -> {
+            _: atom <- say_atom("could not append to the log: ", why);
+            (:no_reply, st)
+        };
+        (:read_failed, why2: atom) -> (:no_reply, on_read_failed(why2, st));
+        (:link_down, why3: atom) -> (:no_reply, on_link_down(why3, st));
+        (:attach, srv: actor_ref) -> (:no_reply, with_srv(st, srv));
+        (:set, to1: actor_ref, k1: string, v1: string) -> (:no_reply, on_set(to1, k1, v1, st));
+        (:get, to2: actor_ref, k2: string) -> (:no_reply, on_get(to2, k2, st));
+        (:del, to3: actor_ref, k3: string) -> (:no_reply, on_del(to3, k3, st));
+        (:keys, to4: actor_ref) -> (:no_reply, on_keys(to4, st));
+        (:bad, to5: actor_ref, text: string) -> (:no_reply, on_bad(to5, text, st))
+    }
+}
+
+// ---- Sessions: one per connection ----
+
+fn ask_set(kv: actor_ref, k: string, v: string) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast(kv, (:set, self(), k, v) impl ActorMessage {})
+    produces
+        pure r
+    end
+}
+
+fn ask_get(kv: actor_ref, k: string) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast(kv, (:get, self(), k) impl ActorMessage {})
+    produces
+        pure r
+    end
+}
+
+fn ask_del(kv: actor_ref, k: string) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast(kv, (:del, self(), k) impl ActorMessage {})
+    produces
+        pure r
+    end
+}
+
+fn ask_keys(kv: actor_ref) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast(kv, (:keys, self()) impl ActorMessage {})
+    produces
+        pure r
+    end
+}
+
+// Errors go through the owner too, so that replies on a connection keep the order of the commands.
+fn ask_bad(kv: actor_ref, text: string) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast(kv, (:bad, self(), text) impl ActorMessage {})
+    produces
+        pure r
+    end
+}
+
+fn send_line(car: dangerous_actor_ref, s: string) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast(car, (:tx, s, self()) impl ActorMessage {})
+    produces
+        pure r
+    end
+}
+
+fn valid_key(k: string) -> boolean {
+    length_bytes(k) > 0 and find(k, 32, 0, length_bytes(k)) < 0
+}
+
+fn do_set(kv: actor_ref, rest: string) -> boolean {
+    rn: int64 <- length_bytes(rest);
+    ks: int64 <- find(rest, 32, 0, rn);
+    case ks < 1 of {
+        true -> ask_bad(kv, "ERR usage: SET <key> <value>");
+        false -> ask_set(kv, slice(rest, 0, ks), slice(rest, ks + 1, rn))
+    }
+}
+
+fn do_get(kv: actor_ref, rest: string) -> boolean {
+    case valid_key(rest) of {
+        true -> ask_get(kv, rest);
+        false -> ask_bad(kv, "ERR usage: GET <key>")
+    }
+}
+
+fn do_del(kv: actor_ref, rest: string) -> boolean {
+    case valid_key(rest) of {
+        true -> ask_del(kv, rest);
+        false -> ask_bad(kv, "ERR usage: DEL <key>")
+    }
+}
+
+fn run_command(kv: actor_ref, verb: string, rest: string) -> boolean {
+    case verb == "SET" of {
+        true -> do_set(kv, rest);
+        false -> case verb == "GET" of {
+            true -> do_get(kv, rest);
+            false -> case verb == "DEL" of {
+                true -> do_del(kv, rest);
+                false -> case verb == "KEYS" of {
+                    true -> ask_keys(kv);
+                    false -> case length_bytes(verb) == 0 of {
+                        true -> true;
+                        false -> ask_bad(kv, "ERR unknown command")
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn verb_of(line: string) -> string {
+    sp: int64 <- find(line, 32, 0, length_bytes(line));
+    case sp < 0 of {
+        true -> line;
+        false -> slice(line, 0, sp)
+    }
+}
+
+fn rest_of(line: string) -> string {
+    n: int64 <- length_bytes(line);
+    sp: int64 <- find(line, 32, 0, n);
+    case sp < 0 of {
+        true -> "";
+        false -> slice(line, sp + 1, n)
+    }
+}
+
+// One command line, without its line end.
+fn dispatch(kv: actor_ref, line: string) -> boolean {
+    run_command(kv, verb_of(line), rest_of(line))
+}
+
+// The line s[0, i) without a trailing carriage return (so `nc` and telnet both work).
+fn line_of(pending: string, i: int64) -> string {
+    case i > 0 and at(pending, i - 1) == 13 of {
+        true -> slice(pending, 0, i - 1);
+        false -> slice(pending, 0, i)
+    }
+}
+
+// Runs every complete line in pending and returns what is left (a partial line).
+fn drain(kv: actor_ref, pending: string) -> string {
+    n: int64 <- length_bytes(pending);
+    i: int64 <- find(pending, 10, 0, n);
+    case i < 0 of {
+        true -> pending;
+        false -> {
+            _: boolean <- dispatch(kv, line_of(pending, i));
+            drain(kv, slice(pending, i + 1, n))
+        }
+    }
+}
+
+// A line that never ends is dropped once it is longer than 4096 bytes.
+fn keep_tail(s: string) -> string {
+    case length_bytes(s) > 4096 of {
+        true -> "";
+        false -> s
+    }
+}
+
+fn session(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom) | (:reply, string),
+           state: { car: dangerous_actor_ref, kv: actor_ref, pending: string })
+    -> (:no_reply, { car: dangerous_actor_ref, kv: actor_ref, pending: string }) {
+    case msg of {
+        (:link_up, _info: string) -> {
+            _: boolean <- give_credit(state.car, window());
+            (:no_reply, state)
+        };
+        (:rx, segment: string) -> {
+            _: boolean <- give_credit(state.car, 1);
+            (:no_reply, { car: state.car, kv: state.kv, pending: keep_tail(drain(state.kv, concat(state.pending, segment))) })
+        };
+        (:reply, text: string) -> {
+            _: boolean <- send_line(state.car, concat(text, "\n"));
+            (:no_reply, state)
+        };
+        (:tx_credit, _n: int64) -> (:no_reply, state);
+        (:tx_failed, _why: atom) -> (:no_reply, state);
+        (:link_down, _why2: atom) -> {
+            sequence proc[concurrency]
+                _: atom <- stop_self(:normal)
+            produces
+                pure (:no_reply, state)
+            end
+        }
+    }
+}
+
+// ---- The listener's owner ----
+
+fn server(msg: (:link_up, string) | (:accepted, dangerous_actor_ref, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom),
+          state: { car: dangerous_actor_ref, kv: actor_ref })
+    -> (:no_reply, { car: dangerous_actor_ref, kv: actor_ref }) {
+    case msg of {
+        (:link_up, info: string) -> {
+            sequence proc[device_io]
+                _: atom <- print("kv-server listening on 127.0.0.1, ");
+                _: atom <- println(info)
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        (:accepted, conn: dangerous_actor_ref, _peer: string) -> {
+            sequence proc[concurrency]
+                ses: actor_ref <- spawn({ car: conn, kv: state.kv, pending: "" }, session, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                _: boolean <- cast(conn, (:open, ses, "") impl ActorMessage {})
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        (:rx, _segment: string) -> (:no_reply, state);
+        (:tx_credit, _n: int64) -> (:no_reply, state);
+        (:tx_failed, _why: atom) -> (:no_reply, state);
+        // The listener went down (for example, port 6380 already in use): stop the program.
+        (:link_down, why2: atom) -> {
+            sequence proc[concurrency, device_io]
+                _: atom <- print("listener down: ");
+                _: atom <- print_atom(why2);
+                _: atom <- println("");
+                _: boolean <- cast_exit(1)
+            produces
+                pure (:no_reply, state)
+            end
+        }
+    }
+}
+
+// The compiler requires every program that spawns actors to register a failure reporter first
+// (spec §15.4.13.4). Each connection's carrier and session end normally when it closes; their
+// reports arrive here and are ignored.
+fn reporter(_report: string, state: { seen: int64 }) -> (:no_reply, { seen: int64 }) {
+    (:no_reply, { seen: state.seen + 1 })
+}
+
+// Start the log carrier, the TCP listener carrier, the owner and the listener's owner. The listener
+// is opened by the owner after it has replayed the log; the log is opened last, here.
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        rep: actor_ref <- spawn({ seen: 0 }, reporter, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: atom <- register_failure_reporter(rep);
+        car: dangerous_actor_ref <- spawn_dangerous_carrier(journal, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        lst: dangerous_actor_ref <- spawn_dangerous({ owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false, listening: false, link_spec: "" }, dangerous_tcp_carrier@carrier, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        kv: actor_ref <- spawn({ car: car, lst: lst, srv: actor_ref_of_word(0), fallback: 0, db: "" }, owner, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        srv: actor_ref <- spawn({ car: lst, kv: kv }, server, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: boolean <- cast(kv, (:attach, srv) impl ActorMessage {});
+        _: boolean <- cast(car, (:open, kv, "") impl ActorMessage {});
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

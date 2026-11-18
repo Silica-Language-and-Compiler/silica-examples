@@ -1,0 +1,415 @@
+// Sensor telemetry over UDP: three sensor actors send temperature and humidity readings,
+// encoded as ETF records, over loopback UDP to a collector. The collector decodes them, keeps
+// min / max / mean per sensor and prints a dashboard every second. After 5 dashboards it prints a
+// final summary and exits (0 when every sensor reported, 1 otherwise).
+//
+//   silica run sensor-telemetry
+//
+// The module is named dangerous_* because it uses the dangerous (:udp) carrier
+// (dangerous_udp_carrier), a dangerous actor over the socket wrappers (error E4021).
+//
+// Flow: the collector's carrier binds a free loopback port and tells the collector (:link_up
+// "port:N"). The collector then spawns one sensor per id, each with a carrier of its own aimed at
+// that port. Each sensor arms a send_after timer, and on every :tick encodes a reading, frames it
+// (wireframe: a datagram travels bare) and casts it to its carrier as (:tx, bytes, self()).
+//
+// The synthetic signal is a small table (a triangle-ish wave) added to a per-sensor base value. It is
+// deterministic. Values are int64 hundredths (2225 means 22.25), all exact multiples of 0.25.
+//
+// SECURITY: UDP on 127.0.0.1 only, no authentication.
+module dangerous_sensor_telemetry;
+
+use wire_etf;
+use wireframe;
+use Carrier;
+use dangerous_sockets;
+use dangerous_udp_carrier;
+
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// The compiler requires every program that spawns actors to register a failure reporter first
+// (spec §15.4.13.4).
+fn reporter(_report: string, state: int64) -> (:no_reply, int64) {
+    (:no_reply, state + 1)
+}
+
+// How many one-second dashboards before the final summary.
+fn dashboards() -> int64 {
+    5
+}
+
+// ---------------------------------------------------------------------------------------------
+// The synthetic signal.
+
+fn wave(k: int64) -> int64 {
+    case k % 8 of {
+        0 -> 0;
+        1 -> 150;
+        2 -> 200;
+        3 -> 150;
+        4 -> 0;
+        5 -> 0 - 150;
+        6 -> 0 - 200;
+        _: int64 -> 0 - 150
+    }
+}
+
+fn base_temp(id: int64) -> int64 {
+    case id of {
+        0 -> 2100;
+        1 -> 1850;
+        _: int64 -> 2400
+    }
+}
+
+fn base_hum(id: int64) -> int64 {
+    case id of {
+        0 -> 4000;
+        1 -> 5500;
+        _: int64 -> 3500
+    }
+}
+
+fn temp_at(id: int64, step: int64) -> int64 {
+    base: int64 <- base_temp(id);
+    w: int64 <- wave(step + id * 3);
+    base + w
+}
+
+fn hum_at(id: int64, step: int64) -> int64 {
+    base: int64 <- base_hum(id);
+    w: int64 <- wave(step + id * 3 + 2);
+    base - w * 5 / 2
+}
+
+// Milliseconds between readings, per sensor. send_after takes a uint64.
+fn period_ms(id: int64) -> uint64 {
+    case id of {
+        0 -> 200;
+        1 -> 250;
+        _: int64 -> 300
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Sensors.
+
+fn first_segment(xs: List[string, mem(normal)]) -> string {
+    case xs of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, _t: List[string, mem(normal)]] -> h
+    }
+}
+
+// One datagram per tick: a record { id, seq, temp, hum } with temp and hum in hundredths.
+// Stats are int64, not float64: a record holding two same-shaped sub-records of float64 fields reads the second as the first (compiler defect, silica-999908), so humidity came out equal to temperature.
+// Encode a reading as ETF, frame it for the (:udp) carrier and hand it to the carrier.
+fn send_reading(car: dangerous_actor_ref, r: { id: int64, seq: int64, temp: int64, hum: int64 }) -> boolean {
+    sequence proc[mem(normal), concurrency, transport]
+        frame: string <- encode((:etf), r);
+        segs: List[string, mem(normal)] <- wireframe@frame(frame, Carrier@mtu((:udp)), Carrier@boundaries((:udp)));
+        seg: string <- first_segment(segs);
+        sent: boolean <- cast(car, (:tx, seg, self()) impl ActorMessage {})
+    produces
+        pure sent
+    end
+}
+
+fn sensor(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom) | :tick, state: { car: dangerous_actor_ref, id: int64, step: int64 }) -> (:no_reply, { car: dangerous_actor_ref, id: int64, step: int64 }) {
+    case msg of {
+        (:link_up, _info: string) -> {
+            sequence proc[concurrency]
+                _: timer_ref <- send_after(period_ms(state.id), self(), :tick impl ActorMessage {})
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        :tick -> {
+            sequence proc[concurrency]
+                t: int64 <- temp_at(state.id, state.step);
+                h: int64 <- hum_at(state.id, state.step);
+                r: { id: int64, seq: int64, temp: int64, hum: int64 } <- { id: state.id, seq: state.step, temp: t, hum: h };
+                _: boolean <- send_reading(state.car, r);
+                _: timer_ref <- send_after(period_ms(state.id), self(), :tick impl ActorMessage {})
+            produces
+                pure (:no_reply, { car: state.car, id: state.id, step: state.step + 1 })
+            end
+        };
+        (:rx, _segment: string) -> (:no_reply, state);
+        (:tx_credit, _n: int64) -> (:no_reply, state);
+        (:tx_failed, _why: atom) -> (:no_reply, state);
+        (:link_down, _why2: atom) -> {
+            sequence proc[concurrency]
+                _: atom <- stop_self(:normal)
+            produces
+                pure (:no_reply, state)
+            end
+        }
+    }
+}
+
+// A sensor and the carrier it sends through; `info` is the collector's "port:N".
+fn start_sensor(id: int64, info: string) -> boolean {
+    sequence proc[concurrency]
+        sc: dangerous_actor_ref <- spawn_dangerous({ owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false, peer_host: "", peer_port: 0, link_spec: "" }, dangerous_udp_carrier@carrier, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        s: actor_ref <- spawn({ car: sc, id: id, step: 0 }, sensor, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        sent: boolean <- cast(sc, (:open, s, concat(concat("127.0.0.1:", substring(info, 5, length_bytes(info))), "@0")) impl ActorMessage {})
+    produces
+        pure sent
+    end
+}
+
+// ---------------------------------------------------------------------------------------------
+// Statistics, in int64 hundredths (see the note at send_reading for why not float64). Every field is bound
+// before the record is built.
+
+fn empty_stat() -> { n: int64, lo: int64, hi: int64, sum: int64 } {
+    { n: 0, lo: 1000000, hi: 0 - 1000000, sum: 0 }
+}
+
+fn add_stat(s: { n: int64, lo: int64, hi: int64, sum: int64 }, x: int64) -> { n: int64, lo: int64, hi: int64, sum: int64 } {
+    n: int64 <- s.n + 1;
+    lo: int64 <- case x < s.lo of { true -> x; false -> s.lo };
+    hi: int64 <- case x > s.hi of { true -> x; false -> s.hi };
+    sum: int64 <- s.sum + x;
+    { n: n, lo: lo, hi: hi, sum: sum }
+}
+
+fn mean(s: { n: int64, lo: int64, hi: int64, sum: int64 }) -> int64 {
+    case s.n > 0 of {
+        true -> s.sum / s.n;
+        false -> 0
+    }
+}
+
+fn empty_group() -> { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } } {
+    t: { n: int64, lo: int64, hi: int64, sum: int64 } <- empty_stat();
+    h: { n: int64, lo: int64, hi: int64, sum: int64 } <- empty_stat();
+    { count: 0, t: t, h: h }
+}
+
+fn add_reading(g: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, r: { id: int64, seq: int64, temp: int64, hum: int64 }) -> { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } } {
+    t: { n: int64, lo: int64, hi: int64, sum: int64 } <- add_stat(g.t, r.temp);
+    h: { n: int64, lo: int64, hi: int64, sum: int64 } <- add_stat(g.h, r.hum);
+    { count: g.count + 1, t: t, h: h }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The collector: receive, unframe, decode, aggregate.
+
+fn with_rx(st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, ticks: int64, got: int64, bad: int64, g0: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g1: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g2: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } } }, rx: { mode: atom, expected: int64, pending: string }) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, ticks: int64, got: int64, bad: int64, g0: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g1: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g2: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } } } {
+    { car: st.car, rx: rx, ticks: st.ticks, got: st.got, bad: st.bad, g0: st.g0, g1: st.g1, g2: st.g2 }
+}
+
+fn with_bad(st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, ticks: int64, got: int64, bad: int64, g0: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g1: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g2: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } } }) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, ticks: int64, got: int64, bad: int64, g0: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g1: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g2: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } } } {
+    { car: st.car, rx: st.rx, ticks: st.ticks, got: st.got, bad: st.bad + 1, g0: st.g0, g1: st.g1, g2: st.g2 }
+}
+
+fn with_tick(st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, ticks: int64, got: int64, bad: int64, g0: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g1: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g2: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } } }) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, ticks: int64, got: int64, bad: int64, g0: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g1: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g2: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } } } {
+    { car: st.car, rx: st.rx, ticks: st.ticks + 1, got: st.got, bad: st.bad, g0: st.g0, g1: st.g1, g2: st.g2 }
+}
+
+// Readings from an id this collector does not track are counted as bad.
+fn record_reading(st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, ticks: int64, got: int64, bad: int64, g0: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g1: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g2: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } } }, r: { id: int64, seq: int64, temp: int64, hum: int64 }) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, ticks: int64, got: int64, bad: int64, g0: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g1: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g2: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } } } {
+    known: boolean <- r.id >= 0 and r.id <= 2;
+    g0: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } } <- case r.id == 0 of { true -> add_reading(st.g0, r); false -> st.g0 };
+    g1: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } } <- case r.id == 1 of { true -> add_reading(st.g1, r); false -> st.g1 };
+    g2: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } } <- case r.id == 2 of { true -> add_reading(st.g2, r); false -> st.g2 };
+    case known of {
+        true -> { car: st.car, rx: st.rx, ticks: st.ticks, got: st.got + 1, bad: st.bad, g0: g0, g1: g1, g2: g2 };
+        false -> with_bad(st)
+    }
+}
+
+fn decode_reading(frame: string) -> (:ok, { id: int64, seq: int64, temp: int64, hum: int64 }) | (:rejected, atom) {
+    sequence proc[mem(normal), transport]
+        d: (:ok, { id: int64, seq: int64, temp: int64, hum: int64 }) | (:rejected, atom) <- decode((:etf), frame)
+    produces
+        pure d
+    end
+}
+
+fn on_frame(st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, ticks: int64, got: int64, bad: int64, g0: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g1: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g2: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } } }, frame: string) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, ticks: int64, got: int64, bad: int64, g0: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g1: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g2: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } } } {
+    case decode_reading(frame) of {
+        (:ok, r: { id: int64, seq: int64, temp: int64, hum: int64 }) -> record_reading(st, r);
+        (:rejected, _why: atom) -> with_bad(st)
+    }
+}
+
+fn on_rx(segment: string, st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, ticks: int64, got: int64, bad: int64, g0: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g1: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g2: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } } }) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, ticks: int64, got: int64, bad: int64, g0: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g1: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g2: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } } } {
+    un: (:more, { mode: atom, expected: int64, pending: string }) | (:frame, string, { mode: atom, expected: int64, pending: string }) | (:rejected, atom) <- wireframe@unframe(st.rx, segment, 4096);
+    case un of {
+        (:more, r1: { mode: atom, expected: int64, pending: string }) -> with_rx(st, r1);
+        (:frame, frame: string, r2: { mode: atom, expected: int64, pending: string }) -> on_frame(with_rx(st, r2), frame);
+        (:rejected, _why: atom) -> with_bad(st)
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Output.
+
+// A value in hundredths printed as whole.frac, e.g. 2225 -> 22.25 (negative values get a '-').
+fn print_hundredths(v: int64) -> atom {
+    mag: int64 <- case v < 0 of { true -> 0 - v; false -> v };
+    sign: string <- case v < 0 of { true -> "-"; false -> "" };
+    whole: int64 <- mag / 100;
+    frac: int64 <- mag % 100;
+    pad: string <- case frac < 10 of { true -> "0"; false -> "" };
+    sequence proc[device_io]
+        _: atom <- print(sign);
+        _: atom <- print_int64(whole);
+        _: atom <- print(".");
+        _: atom <- print(pad);
+        o: atom <- print_int64(frac)
+    produces
+        pure o
+    end
+}
+
+// The mean is sum / n in hundredths, truncated toward zero.
+fn show_stat(label: string, s: { n: int64, lo: int64, hi: int64, sum: int64 }) -> atom {
+    lo: int64 <- s.lo;
+    hi: int64 <- s.hi;
+    m: int64 <- mean(s);
+    sequence proc[device_io]
+        _: atom <- print(label);
+        _: atom <- print(" min=");
+        _: atom <- print_hundredths(lo);
+        _: atom <- print(" max=");
+        _: atom <- print_hundredths(hi);
+        _: atom <- print(" mean=");
+        _: atom <- print_hundredths(m);
+        o: atom <- println("")
+    produces
+        pure o
+    end
+}
+
+fn show_group(id: int64, g: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }) -> atom {
+    sequence proc[device_io]
+        _: atom <- print("sensor ");
+        _: atom <- print_int64(id);
+        _: atom <- print(" readings=");
+        _: atom <- print_int64(g.count);
+        _: atom <- println("");
+        _: atom <- show_stat("  temp C:", g.t);
+        o: atom <- show_stat("  hum %: ", g.h)
+    produces
+        pure o
+    end
+}
+
+fn dashboard(st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, ticks: int64, got: int64, bad: int64, g0: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g1: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g2: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } } }) -> atom {
+    sequence proc[device_io]
+        _: atom <- print("--- dashboard ");
+        _: atom <- print_int64(st.ticks);
+        _: atom <- print(" received=");
+        _: atom <- print_int64(st.got);
+        _: atom <- print(" bad=");
+        _: atom <- print_int64(st.bad);
+        _: atom <- println(" ---");
+        _: atom <- show_group(0, st.g0);
+        _: atom <- show_group(1, st.g1);
+        o: atom <- show_group(2, st.g2)
+    produces
+        pure o
+    end
+}
+
+fn all_reported(st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, ticks: int64, got: int64, bad: int64, g0: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g1: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g2: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } } }) -> boolean {
+    st.g0.count > 0 and st.g1.count > 0 and st.g2.count > 0
+}
+
+fn finish(st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, ticks: int64, got: int64, bad: int64, g0: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g1: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g2: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } } }) -> boolean {
+    ok: boolean <- all_reported(st);
+    code: int64 <- case ok of { true -> 0; false -> 1 };
+    reporting: int64 <- case ok of { true -> 3; false -> 0 };
+    sequence proc[concurrency, device_io]
+        _: atom <- print("FINAL SUMMARY: readings=");
+        _: atom <- print_int64(st.got);
+        _: atom <- print(" rejected=");
+        _: atom <- print_int64(st.bad);
+        _: atom <- print(" sensors_reporting=");
+        _: atom <- print_int64(reporting);
+        _: atom <- println("");
+        done: boolean <- cast_exit(code)
+    produces
+        pure done
+    end
+}
+
+fn collector(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom) | :dash, state: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, ticks: int64, got: int64, bad: int64, g0: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g1: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g2: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } } }) -> (:no_reply, { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, ticks: int64, got: int64, bad: int64, g0: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g1: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g2: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } } }) {
+    case msg of {
+        (:link_up, info: string) -> {
+            sequence proc[concurrency, device_io]
+                _: boolean <- cast(state.car, (:credit, 64) impl ActorMessage {});
+                _: atom <- print("collector listening on 127.0.0.1 ");
+                _: atom <- println(info);
+                _: boolean <- start_sensor(0, info);
+                _: boolean <- start_sensor(1, info);
+                _: boolean <- start_sensor(2, info);
+                _: timer_ref <- send_after(1000, self(), :dash impl ActorMessage {})
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        (:rx, segment: string) -> {
+            sequence proc[concurrency]
+                next: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, ticks: int64, got: int64, bad: int64, g0: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g1: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g2: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } } } <- on_rx(segment, state);
+                _: boolean <- cast(state.car, (:credit, 1) impl ActorMessage {})
+            produces
+                pure (:no_reply, next)
+            end
+        };
+        :dash -> {
+            st2: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, ticks: int64, got: int64, bad: int64, g0: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g1: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g2: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } } } <- with_tick(state);
+            case st2.ticks >= dashboards() of {
+                true -> {
+                    sequence
+                        _: atom <- dashboard(st2);
+                        _: boolean <- finish(st2)
+                    produces
+                        pure (:no_reply, st2)
+                    end
+                };
+                false -> {
+                    sequence proc[concurrency]
+                        _: atom <- dashboard(st2);
+                        _: timer_ref <- send_after(1000, self(), :dash impl ActorMessage {})
+                    produces
+                        pure (:no_reply, st2)
+                    end
+                }
+            }
+        };
+        (:tx_credit, _n: int64) -> (:no_reply, state);
+        (:tx_failed, _why: atom) -> (:no_reply, state);
+        (:link_down, why2: atom) -> {
+            sequence proc[concurrency, device_io]
+                _: atom <- print("collector link down: ");
+                _: atom <- print_atom(why2);
+                _: atom <- println("");
+                _: boolean <- cast_exit(1)
+            produces
+                pure (:no_reply, state)
+            end
+        }
+    }
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        rep: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: atom <- register_failure_reporter(rep);
+        car: dangerous_actor_ref <- spawn_dangerous({ owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false, peer_host: "", peer_port: 0, link_spec: "" }, dangerous_udp_carrier@carrier, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        g: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } } <- empty_group();
+        init: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, ticks: int64, got: int64, bad: int64, g0: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g1: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } }, g2: { count: int64, t: { n: int64, lo: int64, hi: int64, sum: int64 }, h: { n: int64, lo: int64, hi: int64, sum: int64 } } } <- { car: car, rx: wireframe@fresh(Carrier@boundaries((:udp))), ticks: 0, got: 0, bad: 0, g0: g, g1: g, g2: g };
+        col: actor_ref <- spawn(init, collector, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: boolean <- cast(car, (:open, col, "127.0.0.1:1@0") impl ActorMessage {});
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

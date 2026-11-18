@@ -1,0 +1,460 @@
+// Parallel word count: a map-reduce across the CPU cores.
+//
+//   cores used: 8
+//   mapper 3 on core 3 counted 10 words
+//   ...
+//   total words: 91
+//   distinct words: 32
+//   top 10 words:
+//     1. the: 19
+//     2. dog: 9
+//     ...
+//
+// The program asks the runtime how many cores there are (get_performance_cores and
+// get_efficiency_cores), spawns one MAPPER actor per core (at most 8) and pins each one to its core
+// with the optional last argument of `spawn`. The built-in corpus is dealt out line by line: mapper j
+// gets the lines whose index modulo the core count is j. Each mapper tokenizes its chunk byte by
+// byte (letters and digits make a word, everything else separates words, upper case is folded to
+// lower case), counts the words, and casts its partial counts to one REDUCER actor: one
+// (:count, word, n) message per distinct word, then (:done, core, words). Messages from one sender
+// arrive in order, so when the reducer has seen every :done it has seen every count. It merges the
+// counts into a list of { w, n } records, prints the total and the ten most frequent words (ties
+// broken alphabetically, so the output does not depend on which mapper finishes first) and ends the
+// program with cast_exit(0).
+//
+// The number of mappers and which mapper finishes first depend on the machine, so the "mapper ..."
+// lines can come in any order and their counts depend on the core count. The totals do not.
+//
+// Pinning: on an OS-hosted target (macOS, Linux) the core id asks the OS for thread affinity. Linux
+// can enforce it; Apple Silicon macOS treats it as a hint (spec 15.1.2, "Actor Pinning Policy").
+// The program works the same either way.
+//
+//   silica run parallel-wordcount
+
+// ---------------------------------------------------------------------------------------------
+// The corpus: eight lines. 91 words, 32 of them distinct.
+
+fn corpus() -> List[string, mem(normal)] {
+    sequence proc[mem(normal)]
+        xs: List[string, mem(normal)] <- [
+            "The quick brown fox jumps over the lazy dog.",
+            "The dog barks; the fox runs away, and the dog follows.",
+            "A quick brown dog is not a lazy dog, said the fox.",
+            "Over the hills and far away, the fox and the dog ran.",
+            "Quick! Quick! The lazy fox sleeps under the old oak tree.",
+            "Brown leaves fall from the oak tree, and the dog sleeps.",
+            "The fox and the dog are friends: the quick fox, the lazy dog.",
+            "Far away the hills are green, and the old oak tree stands."
+        ]
+    produces
+        pure xs
+    end
+}
+
+// Lines idx, idx + 1, ... of xs whose index modulo n is j, joined with spaces.
+fn chunk_for(xs: List[string, mem(normal)], j: int64, n: int64, idx: int64) -> string {
+    case xs of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, t: List[string, mem(normal)]] -> case idx % n == j of {
+            true -> concat(concat(h, " "), chunk_for(t, j, n, idx + 1));
+            false -> chunk_for(t, j, n, idx + 1)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Bytes. byte_at is a transport operation, so it is called inside a sequence that declares
+// `transport` and the rest of the code stays plain.
+
+fn at(s: string, i: int64) -> int64 {
+    sequence proc[transport]
+        b: int64 <- byte_at(s, i)
+    produces
+        pure b
+    end
+}
+
+// Folds A-Z (65-90) to a-z (97-122).
+fn lower(b: int64) -> int64 {
+    case b >= 65 and b <= 90 of {
+        true -> b + 32;
+        false -> b
+    }
+}
+
+// A word byte is a lower case letter or a digit (the byte has been lowered already).
+fn is_word_byte(b: int64) -> boolean {
+    (b >= 97 and b <= 122) or (b >= 48 and b <= 57)
+}
+
+fn nil_bytes() -> List[int64, mem(normal)] {
+    sequence proc[mem(normal)]
+        out: List[int64, mem(normal)] <- empty[int64, mem(normal)]()
+    produces
+        pure out
+    end
+}
+
+fn cons_byte(x: int64, rest: List[int64, mem(normal)]) -> List[int64, mem(normal)] {
+    sequence proc[mem(normal)]
+        out: List[int64, mem(normal)] <- prepend[int64, mem(normal)](x, rest)
+    produces
+        pure out
+    end
+}
+
+// The lowered bytes of s[i, e), in order.
+fn lower_bytes(s: string, i: int64, e: int64) -> List[int64, mem(normal)] {
+    case i >= e of {
+        true -> nil_bytes();
+        false -> cons_byte(lower(at(s, i)), lower_bytes(s, i + 1, e))
+    }
+}
+
+// s[i, e) as a new lower case string.
+fn word_of(s: string, i: int64, e: int64) -> string {
+    sequence proc[mem(normal), transport]
+        w: string <- bytes_of(lower_bytes(s, i, e))
+    produces
+        pure w
+    end
+}
+
+// Whether a and b agree on every byte from i up to n.
+fn same_from(a: string, b: string, i: int64, n: int64) -> boolean {
+    case i >= n of {
+        true -> true;
+        false -> case at(a, i) == at(b, i) of {
+            true -> same_from(a, b, i + 1, n);
+            false -> false
+        }
+    }
+}
+
+fn same_word(a: string, b: string) -> boolean {
+    na: int64 <- length_bytes(a);
+    nb: int64 <- length_bytes(b);
+    case na == nb of {
+        true -> same_from(a, b, 0, na);
+        false -> false
+    }
+}
+
+// Byte-wise "a sorts before b".
+fn lt_from(a: string, b: string, i: int64, na: int64, nb: int64) -> boolean {
+    case i >= na of {
+        true -> na < nb;
+        false -> case i >= nb of {
+            true -> false;
+            false -> case at(a, i) == at(b, i) of {
+                true -> lt_from(a, b, i + 1, na, nb);
+                false -> at(a, i) < at(b, i)
+            }
+        }
+    }
+}
+
+fn word_lt(a: string, b: string) -> boolean {
+    na: int64 <- length_bytes(a);
+    nb: int64 <- length_bytes(b);
+    lt_from(a, b, 0, na, nb)
+}
+
+// ---------------------------------------------------------------------------------------------
+// The count table: a list of { w, n } records, one per distinct word.
+
+fn nil_table() -> List[{ w: string, n: int64 }, mem(normal)] {
+    sequence proc[mem(normal)]
+        out: List[{ w: string, n: int64 }, mem(normal)] <- empty[{ w: string, n: int64 }, mem(normal)]()
+    produces
+        pure out
+    end
+}
+
+fn cons_entry(x: { w: string, n: int64 }, rest: List[{ w: string, n: int64 }, mem(normal)]) -> List[{ w: string, n: int64 }, mem(normal)] {
+    sequence proc[mem(normal)]
+        out: List[{ w: string, n: int64 }, mem(normal)] <- prepend[{ w: string, n: int64 }, mem(normal)](x, rest)
+    produces
+        pure out
+    end
+}
+
+// Adds k to the count of word w, or appends the entry when w is new.
+fn bump(table: List[{ w: string, n: int64 }, mem(normal)], w: string, k: int64) -> List[{ w: string, n: int64 }, mem(normal)] {
+    case table of {
+        []: List[{ w: string, n: int64 }, mem(normal)] -> cons_entry({ w: w, n: k }, nil_table());
+        [h: { w: string, n: int64 }, t: List[{ w: string, n: int64 }, mem(normal)]] -> case same_word(h.w, w) of {
+            true -> cons_entry({ w: h.w, n: h.n + k }, t);
+            false -> cons_entry(h, bump(t, w, k))
+        }
+    }
+}
+
+// The table without the entry for word w.
+fn drop_word(table: List[{ w: string, n: int64 }, mem(normal)], w: string) -> List[{ w: string, n: int64 }, mem(normal)] {
+    case table of {
+        []: List[{ w: string, n: int64 }, mem(normal)] -> nil_table();
+        [h: { w: string, n: int64 }, t: List[{ w: string, n: int64 }, mem(normal)]] -> case same_word(h.w, w) of {
+            true -> t;
+            false -> cons_entry(h, drop_word(t, w))
+        }
+    }
+}
+
+// Whether entry a ranks above entry b: a higher count, or the same count and an earlier word.
+fn beats(a: { w: string, n: int64 }, b: { w: string, n: int64 }) -> boolean {
+    a.n > b.n or (a.n == b.n and word_lt(a.w, b.w))
+}
+
+fn best_of(table: List[{ w: string, n: int64 }, mem(normal)], cur: { w: string, n: int64 }) -> { w: string, n: int64 } {
+    case table of {
+        []: List[{ w: string, n: int64 }, mem(normal)] -> cur;
+        [h: { w: string, n: int64 }, t: List[{ w: string, n: int64 }, mem(normal)]] -> case beats(h, cur) of {
+            true -> best_of(t, h);
+            false -> best_of(t, cur)
+        }
+    }
+}
+
+fn table_size(table: List[{ w: string, n: int64 }, mem(normal)]) -> int64 {
+    case table of {
+        []: List[{ w: string, n: int64 }, mem(normal)] -> 0;
+        [_h: { w: string, n: int64 }, t: List[{ w: string, n: int64 }, mem(normal)]] -> 1 + table_size(t)
+    }
+}
+
+fn table_total(table: List[{ w: string, n: int64 }, mem(normal)]) -> int64 {
+    case table of {
+        []: List[{ w: string, n: int64 }, mem(normal)] -> 0;
+        [h: { w: string, n: int64 }, t: List[{ w: string, n: int64 }, mem(normal)]] -> h.n + table_total(t)
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Tokenizing: start is the index where the current word began, or -1 between words.
+
+fn flush(s: string, start: int64, e: int64, table: List[{ w: string, n: int64 }, mem(normal)]) -> List[{ w: string, n: int64 }, mem(normal)] {
+    case start < 0 of {
+        true -> table;
+        false -> bump(table, word_of(s, start, e), 1)
+    }
+}
+
+fn tokenize(s: string, i: int64, n: int64, start: int64, table: List[{ w: string, n: int64 }, mem(normal)]) -> List[{ w: string, n: int64 }, mem(normal)] {
+    case i >= n of {
+        true -> flush(s, start, i, table);
+        false -> case is_word_byte(lower(at(s, i))) of {
+            true -> case start < 0 of {
+                true -> tokenize(s, i + 1, n, i, table);
+                false -> tokenize(s, i + 1, n, start, table)
+            };
+            false -> tokenize(s, i + 1, n, 0 - 1, flush(s, start, i, table))
+        }
+    }
+}
+
+fn count_words(chunk: string) -> List[{ w: string, n: int64 }, mem(normal)] {
+    n: int64 <- length_bytes(chunk);
+    tokenize(chunk, 0, n, 0 - 1, nil_table())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Printing.
+
+fn say(s: string) -> atom {
+    sequence proc[device_io]
+        o: atom <- println(s)
+    produces
+        pure o
+    end
+}
+
+fn say_n(label: string, n: int64) -> atom {
+    sequence proc[device_io]
+        _: atom <- print(label);
+        _: atom <- print_int64(n);
+        o: atom <- println("")
+    produces
+        pure o
+    end
+}
+
+fn say_mapper(core: int64, words: int64) -> atom {
+    sequence proc[device_io]
+        _: atom <- print("mapper ");
+        _: atom <- print_int64(core);
+        _: atom <- print(" on core ");
+        _: atom <- print_int64(core);
+        _: atom <- print(" counted ");
+        _: atom <- print_int64(words);
+        o: atom <- println(" words")
+    produces
+        pure o
+    end
+}
+
+fn say_rank(rank: int64, e: { w: string, n: int64 }) -> atom {
+    sequence proc[device_io]
+        _: atom <- print("  ");
+        _: atom <- print_int64(rank);
+        _: atom <- print(". ");
+        _: atom <- print(e.w);
+        _: atom <- print(": ");
+        _: atom <- print_int64(e.n);
+        o: atom <- println("")
+    produces
+        pure o
+    end
+}
+
+// The k best entries, one per line, best first.
+fn print_top(table: List[{ w: string, n: int64 }, mem(normal)], k: int64, rank: int64) -> atom {
+    case k == 0 of {
+        true -> :ok;
+        false -> case table of {
+            []: List[{ w: string, n: int64 }, mem(normal)] -> :ok;
+            [h: { w: string, n: int64 }, t: List[{ w: string, n: int64 }, mem(normal)]] -> {
+                top: { w: string, n: int64 } <- best_of(t, h);
+                _: atom <- say_rank(rank, top);
+                print_top(drop_word(table, top.w), k - 1, rank + 1)
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Messages to the reducer: tell it one partial count, or that a mapper has sent all of its counts.
+
+fn tell(red: actor_ref, m: (:count, string, int64) | (:done, int64, int64)) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast(red, m impl ActorMessage {})
+    produces
+        pure r
+    end
+}
+
+fn send_counts(red: actor_ref, table: List[{ w: string, n: int64 }, mem(normal)]) -> boolean {
+    case table of {
+        []: List[{ w: string, n: int64 }, mem(normal)] -> true;
+        [h: { w: string, n: int64 }, t: List[{ w: string, n: int64 }, mem(normal)]] -> {
+            _: boolean <- tell(red, (:count, h.w, h.n));
+            send_counts(red, t)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The mapper: its message is a chunk of text. It counts the words and sends the partial counts to
+// the reducer, then reports the core it was pinned to and how many words it saw.
+
+fn mapper(chunk: string, st: { reducer: actor_ref, core: int64 }) -> (:no_reply, { reducer: actor_ref, core: int64 }) {
+    table: List[{ w: string, n: int64 }, mem(normal)] <- count_words(chunk);
+    _: boolean <- send_counts(st.reducer, table);
+    _: boolean <- tell(st.reducer, (:done, st.core, table_total(table)));
+    (:no_reply, st)
+}
+
+// ---------------------------------------------------------------------------------------------
+// The reducer: merges the partial counts. When the last mapper is done it prints the result and
+// ends the program.
+
+fn stop(code: int64) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast_exit(code)
+    produces
+        pure r
+    end
+}
+
+fn finish(st: { table: List[{ w: string, n: int64 }, mem(normal)], done: int64, expected: int64, total: int64 }) -> atom {
+    _: atom <- say_n("total words: ", st.total);
+    _: atom <- say_n("distinct words: ", table_size(st.table));
+    _: atom <- say("top 10 words:");
+    _: atom <- print_top(st.table, 10, 1);
+    _: boolean <- stop(0);
+    :ok
+}
+
+fn on_done(core: int64, words: int64, st: { table: List[{ w: string, n: int64 }, mem(normal)], done: int64, expected: int64, total: int64 }) -> { table: List[{ w: string, n: int64 }, mem(normal)], done: int64, expected: int64, total: int64 } {
+    next: { table: List[{ w: string, n: int64 }, mem(normal)], done: int64, expected: int64, total: int64 } <- { table: st.table, done: st.done + 1, expected: st.expected, total: st.total + words };
+    _: atom <- say_mapper(core, words);
+    _: atom <- case next.done == next.expected of {
+        true -> finish(next);
+        false -> :ok
+    };
+    next
+}
+
+fn reducer(msg: (:count, string, int64) | (:done, int64, int64), st: { table: List[{ w: string, n: int64 }, mem(normal)], done: int64, expected: int64, total: int64 }) -> (:no_reply, { table: List[{ w: string, n: int64 }, mem(normal)], done: int64, expected: int64, total: int64 }) {
+    case msg of {
+        (:count, w: string, k: int64) -> (:no_reply, { table: bump(st.table, w, k), done: st.done, expected: st.expected, total: st.total });
+        (:done, core: int64, words: int64) -> (:no_reply, on_done(core, words, st))
+    }
+}
+
+fn initial_reducer(expected: int64) -> { table: List[{ w: string, n: int64 }, mem(normal)], done: int64, expected: int64, total: int64 } {
+    { table: nil_table(), done: 0, expected: expected, total: 0 }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Start-up.
+
+// How many logical cores the runtime reports, kept between 1 and 8 (the corpus has 8 lines).
+fn core_count() -> int64 {
+    sequence proc[concurrency, mem(normal)]
+        pc: List[int64, mem(normal)] <- get_performance_cores();
+        ec: List[int64, mem(normal)] <- get_efficiency_cores();
+        p: int64 <- length[int64, mem(normal)](pc);
+        e: int64 <- length[int64, mem(normal)](ec);
+        tot: int64 <- p + e
+    produces
+        pure case tot < 1 of {
+            true -> 1;
+            false -> case tot > 8 of {
+                true -> 8;
+                false -> tot
+            }
+        }
+    end
+}
+
+// Spawns mapper i, pinned to core i, and hands it its chunk; then the next, up to n mappers.
+fn start_mappers(red: actor_ref, lines: List[string, mem(normal)], i: int64, n: int64) -> int64 {
+    case i >= n of {
+        true -> n;
+        false -> {
+            sequence proc[concurrency]
+                m: actor_ref <- spawn({ reducer: red, core: i }, mapper, stack_policy(0, :keep_last_message), state_policy(:keep_state_area), to_uint64(i));
+                chunk: string <- chunk_for(lines, i, n, 0);
+                _: boolean <- cast(m, chunk impl ActorMessage {})
+            produces
+                pure start_mappers(red, lines, i + 1, n)
+            end
+        }
+    }
+}
+
+// How many memory regions to dump when an actor fails (none here).
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// The compiler requires every program that spawns actors to register a failure reporter first
+// (spec §15.4.13.4). This one counts the reports and ignores them.
+fn reporter(_report: string, state: int64) -> (:no_reply, int64) {
+    (:no_reply, state + 1)
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        rep: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: atom <- register_failure_reporter(rep);
+        n: int64 <- core_count();
+        _: atom <- say_n("cores used: ", n);
+        red: actor_ref <- spawn(initial_reducer(n), reducer, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: int64 <- start_mappers(red, corpus(), 0, n);
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

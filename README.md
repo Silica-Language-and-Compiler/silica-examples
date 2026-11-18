@@ -18,6 +18,11 @@ Small, runnable programs written in [Silica](https://github.com/Silica-Language-
 | [`ml-linear-regression`](ml-linear-regression/) | Least-squares linear regression over a CSV file, replayed from a `(:store)` storage carrier: records unframed, `decode`d and parsed, with flat memory however long the file is |
 | [`read-log-file`](read-log-file/) | Reading a text log through a `(:store)` storage carrier and printing its `[ERROR]` rows, with a byte-level parser and per-level counts |
 | [`local-persistence`](local-persistence/) | A log that survives between runs: each run appends to a `(:store)` carrier on a `(:backing)` file, syncs it to disk and replays everything stored so far |
+| [`self-healing-workers`](self-healing-workers/) | Let it crash: a `Supervisor` restarts workers that die on poisoned jobs, a `FailureReporter` prints each crash, and the work carries on |
+| [`kv-server`](kv-server/) | A small Redis-like key-value server on `127.0.0.1:6380` (`SET`, `GET`, `DEL`, `KEYS`): the `(:tcp)` carrier for clients and a `(:store)` log that restores the data after a restart |
+| [`route-planner`](route-planner/) | Dijkstra shortest paths and Prim's minimum spanning tree over a European road network, using the standard library's weighted graph and Brodal–Okasaki priority queue |
+| [`sensor-telemetry`](sensor-telemetry/) | Timer-driven sensor actors send `wire_etf`-encoded readings over the `(:udp)` carrier to a collector that prints a live min/max/mean dashboard |
+| [`parallel-wordcount`](parallel-wordcount/) | Map-reduce word count: one mapper actor pinned to each CPU core, merged by a reducer into totals and a top-10 list |
 
 The games play themselves: the language doesn't read from standard input yet, so there is no keyboard input. `dice-race` compiles with warning W2300, which says the referee's state is copied after every message. That's fine at this size.
 
