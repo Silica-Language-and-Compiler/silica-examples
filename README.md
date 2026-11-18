@@ -16,6 +16,7 @@ Small, runnable programs written in [Silica](https://github.com/Silica-Language-
 | [`simple-web-server`](simple-web-server/) | An HTTP server on `127.0.0.1:5173` that answers every request with one fixed response, built from actors and the standard library's `(:tcp)` carrier |
 | [`web-server-from-static-files`](web-server-from-static-files/) | An HTTP server that keeps its files in a Silica store (`(:store)` carrier, `site.sildat`): `PUT` stores a file, `GET` streams it back in chunks |
 | [`ml-linear-regression`](ml-linear-regression/) | Least-squares linear regression over a CSV file, replayed from a `(:store)` storage carrier: records unframed, `decode`d and parsed, with flat memory however long the file is |
+| [`read-log-file`](read-log-file/) | Reading a text log through a `(:store)` storage carrier and printing its `[ERROR]` rows, with a byte-level parser and per-level counts |
 
 The games play themselves: the language doesn't read from standard input yet, so there is no keyboard input. `dice-race` compiles with warning W2300, which says the referee's state is copied after every message. That's fine at this size.
 
@@ -76,6 +77,13 @@ Hello Web Server
 ```console
 $ python3 ml-linear-regression/csv_to_sildat.py
 $ silica run ml-linear-regression
+```
+
+`read-log-file` reads a text log through the same kind of backing. `silica sildat` packs the log; `--capacity` is the size in the program's `(:backing)` link:
+
+```console
+$ silica sildat read-log-file/app.log read-log-file/__ignore__app.sildat --capacity 1048576
+$ silica run read-log-file
 ```
 
 See [`simple-web-server/README.md`](simple-web-server/README.md) and [`web-server-from-static-files/README.md`](web-server-from-static-files/README.md) for how they work.

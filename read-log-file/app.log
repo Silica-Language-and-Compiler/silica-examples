@@ -1,0 +1,21 @@
+2026-11-17 08:00:01 [LOG] server starting on 127.0.0.1:8080
+2026-11-17 08:00:01 [LOG] loaded config from /etc/shop/config.toml
+2026-11-17 08:00:02 [LOG] connected to database orders_db (pool size 8)
+2026-11-17 08:00:02 [WARN] cache warm-up skipped: redis not configured
+2026-11-17 08:00:05 [LOG] GET /health 200 2ms
+2026-11-17 08:01:12 [LOG] GET /products 200 41ms
+2026-11-17 08:01:13 [LOG] GET /products/1182 200 12ms
+2026-11-17 08:01:20 [ERROR] POST /checkout 500 payment gateway timeout after 30000ms (order 77812)
+2026-11-17 08:01:21 [LOG] GET /cart 200 9ms
+2026-11-17 08:02:03 [WARN] slow query on orders: 1840ms (threshold 1000ms)
+2026-11-17 08:02:40 [LOG] POST /login 200 88ms
+2026-11-17 08:02:41 [ERROR] POST /login 401 invalid password for user id 4410 (attempt 3 of 3)
+2026-11-17 08:03:15 [LOG] GET /products?page=2 200 37ms
+2026-11-17 08:03:59 [WARN] disk usage at 86% on /var/lib/shop
+2026-11-17 08:04:30 [ERROR] worker email-3 crashed: smtp connection refused (restarting)
+2026-11-17 08:04:31 [LOG] worker email-3 restarted
+2026-11-17 08:05:00 [LOG] GET /health 200 1ms
+2026-11-17 08:05:12 [ERROR] GET /orders/99120 404 order not found
+2026-11-17 08:06:44 [WARN] retrying webhook delivery to partner-api (attempt 2)
+2026-11-17 08:07:02 [LOG] shutdown requested, draining 3 connections
+2026-11-17 08:07:03 [LOG] server stopped

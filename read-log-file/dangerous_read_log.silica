@@ -1,0 +1,374 @@
+// Read a log file and print every failed row: the lines logged at [ERROR]. LOG and WARN lines are
+// counted but not printed.
+//
+//   $ silica sildat read-log-file/app.log read-log-file/__ignore__app.sildat --capacity 1048576
+//   $ silica run read-log-file
+//   lines in the log: 21
+//   failed rows:
+//     line 8: 2026-11-17 08:01:20 [ERROR] POST /checkout 500 payment gateway timeout after 30000ms (order 77812)
+//     line 12: 2026-11-17 08:02:41 [ERROR] POST /login 401 invalid password for user id 4410 (attempt 3 of 3)
+//     line 15: 2026-11-17 08:04:30 [ERROR] worker email-3 crashed: smtp connection refused (restarting)
+//     line 18: 2026-11-17 08:05:12 [ERROR] GET /orders/99120 404 order not found
+//   LOG:   13
+//   WARN:  4
+//   ERROR: 4
+//
+// Silica has no files, paths or directories. A program reads data only through a STORAGE CARRIER
+// (transport_serialization_design.md §6.8): the `(:store)` declarations below, whose
+// `(:backing, path, capacity, retention)` link is the only place a host path appears. The backing is
+// an append-only log of records, so `silica sildat` first turns app.log into that form, one stored
+// value per line: the line as a string, encoded with (:etf), wrapped by wireframe@record and framed
+// for the :storage boundaries.
+//
+// The program then:
+//   1. starts the carrier and opens it; the carrier answers (:link_up, info) and
+//      (:log, oldest, next, capacity);
+//   2. asks for a replay with (:read, oldest) and a receive window of credit;
+//   3. for every (:rx, segment): unframes it, unrecords it and DECODES it (stored bytes are untrusted
+//      until decode re-creates the value, §6.8.3), reads the level between '[' and ']', prints the
+//      line if the level is ERROR, counts it, and hands the carrier one more credit;
+//   4. on (:rx_end, next): prints the counts and sends :close;
+//   5. on (:link_down, :closed): ends the program.
+//
+// The module is named dangerous_ because it starts a (:backing) carrier, a dangerous actor over the
+// standard library's C store wrapper (E4021).
+module dangerous_read_log;
+
+use wireframe;
+use Carrier;
+use storelog;
+use wire_etf;
+use dangerous_store;
+use dangerous_store_backing_carrier;
+
+// A backing path is relative to the directory the program runs in. `logfile` is the path from the
+// silica-examples root (`silica run read-log-file`); `logfile_here` is the same file from inside the
+// project folder (`silica run .`). The program opens `logfile` first and falls back to
+// `logfile_here` when that path does not resolve (on_link_down). The capacity must match
+// the --capacity passed to `silica sildat`.
+carried_on logfile: (:store) (:backing, "read-log-file/__ignore__app.sildat", 1048576, :stop);
+carried_on logfile_here: (:store) (:backing, "__ignore__app.sildat", 1048576, :stop);
+
+// How many replayed records may be in flight to the owner at once.
+fn window() -> int64 {
+    8
+}
+
+// The schema version `silica sildat` stores lines under (its default).
+fn line_schema() -> int64 {
+    1
+}
+
+// ---------------------------------------------------------------------------------------------
+// Reading the level of one line, "<date> <time> [LEVEL] message". byte_at is a transport
+// operation, so it is called inside a sequence that declares `transport` and the parser stays pure.
+
+fn at(s: string, i: int64) -> int64 {
+    sequence proc[transport]
+        b: int64 <- byte_at(s, i)
+    produces
+        pure b
+    end
+}
+
+// The index of the first byte b at or after i, or -1.
+fn find(s: string, b: int64, i: int64, n: int64) -> int64 {
+    case i >= n of {
+        true -> 0 - 1;
+        false -> case at(s, i) == b of {
+            true -> i;
+            false -> find(s, b, i + 1, n)
+        }
+    }
+}
+
+// Whether s[i + j, i + m) equals w[j, m).
+fn same(s: string, i: int64, w: string, j: int64, m: int64) -> boolean {
+    case j >= m of {
+        true -> true;
+        false -> case at(s, i + j) == at(w, j) of {
+            true -> same(s, i, w, j + 1, m);
+            false -> false
+        }
+    }
+}
+
+// Whether s[i, e) is exactly the word w.
+fn word_is(s: string, i: int64, e: int64, w: string) -> boolean {
+    m: int64 <- length_bytes(w);
+    case e - i == m of {
+        true -> same(s, i, w, 0, m);
+        false -> false
+    }
+}
+
+fn level_of(line: string) -> :log | :warn | :error | :unknown {
+    n: int64 <- length_bytes(line);
+    open: int64 <- find(line, 91, 0, n);
+    case open < 0 of {
+        true -> :unknown;
+        false -> {
+            close: int64 <- find(line, 93, open + 1, n);
+            case close < 0 of {
+                true -> :unknown;
+                false -> level_word(line, open + 1, close)
+            }
+        }
+    }
+}
+
+fn level_word(line: string, i: int64, e: int64) -> :log | :warn | :error | :unknown {
+    case word_is(line, i, e, "ERROR") of {
+        true -> :error;
+        false -> case word_is(line, i, e, "WARN") of {
+            true -> :warn;
+            false -> case word_is(line, i, e, "LOG") of {
+                true -> :log;
+                false -> :unknown
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// From a stored frame to a line of text: take off the record header, check the format and schema,
+// and decode. decode re-creates the string from untrusted bytes, or rejects them.
+
+fn line_of(frame: string) -> (:line, string) | (:unreadable, atom) {
+    case wireframe@unrecord(frame) of {
+        (:rejected, why: atom) -> (:unreadable, why);
+        (:ok, format: atom, schema: int64, body: string) -> case format == :etf and schema == line_schema() of {
+            false -> (:unreadable, :unknown_schema);
+            true -> decoded(body)
+        }
+    }
+}
+
+fn decoded(body: string) -> (:line, string) | (:unreadable, atom) {
+    sequence proc[mem(normal), transport]
+        r: (:ok, string) | (:rejected, atom) <- decode((:etf), body, { max_bytes: 4096 })
+    produces
+        pure case r of {
+            (:ok, line: string) -> (:line, line);
+            (:rejected, why: atom) -> (:unreadable, why)
+        }
+    end
+}
+
+// ---------------------------------------------------------------------------------------------
+// Printing.
+
+fn say(s: string) -> atom {
+    sequence proc[device_io]
+        o: atom <- println(s)
+    produces
+        pure o
+    end
+}
+
+fn say_n(label: string, n: int64) -> atom {
+    sequence proc[device_io]
+        _: atom <- print(label);
+        _: atom <- print_int64(n);
+        o: atom <- println("")
+    produces
+        pure o
+    end
+}
+
+fn say_atom(label: string, a: atom) -> atom {
+    sequence proc[device_io]
+        _: atom <- print(label);
+        _: atom <- print_atom(a);
+        o: atom <- println("")
+    produces
+        pure o
+    end
+}
+
+// Line numbers are 1-based, as in an editor.
+fn say_failed(line_no: int64, text: string) -> atom {
+    sequence proc[device_io]
+        _: atom <- print("  line ");
+        _: atom <- print_int64(line_no);
+        _: atom <- print(": ");
+        o: atom <- println(text)
+    produces
+        pure o
+    end
+}
+
+// ---------------------------------------------------------------------------------------------
+// Talking to the carrier.
+
+fn tell(car: dangerous_actor_ref, m: :close | (:read, int64) | (:credit, int64)) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast(car, m impl ActorMessage {})
+    produces
+        pure r
+    end
+}
+
+fn replay(car: dangerous_actor_ref, from: int64) -> boolean {
+    _: boolean <- tell(car, (:read, from));
+    tell(car, (:credit, window()))
+}
+
+fn stop(code: int64) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast_exit(code)
+    produces
+        pure r
+    end
+}
+
+// ---------------------------------------------------------------------------------------------
+// The owner: one actor that receives everything the carrier sends. Its state is the carrier, which
+// declaration it is on (fallback), the reassembly state of the :storage framing, the number of the
+// next line and a count per level.
+
+fn on_log(oldest: int64, nx: int64, st: { car: dangerous_actor_ref, fallback: int64, rx: { mode: atom, expected: int64, pending: string }, line: int64, logs: int64, warns: int64, errors: int64, other: int64 }) -> { car: dangerous_actor_ref, fallback: int64, rx: { mode: atom, expected: int64, pending: string }, line: int64, logs: int64, warns: int64, errors: int64, other: int64 } {
+    case nx <= oldest of {
+        true -> {
+            _: atom <- say("the log is empty: run `silica sildat read-log-file/app.log read-log-file/__ignore__app.sildat --capacity 1048576` first");
+            _: boolean <- tell(st.car, :close);
+            st
+        };
+        false -> {
+            _: atom <- say_n("lines in the log: ", nx - oldest);
+            _: atom <- say("failed rows:");
+            _: boolean <- replay(st.car, oldest);
+            st
+        }
+    }
+}
+
+// One replayed record. A line fits in one record, so it is one whole frame, but the :storage framing
+// is still followed, so a value split across records would be put back together here.
+fn on_rx(segment: string, st: { car: dangerous_actor_ref, fallback: int64, rx: { mode: atom, expected: int64, pending: string }, line: int64, logs: int64, warns: int64, errors: int64, other: int64 }) -> { car: dangerous_actor_ref, fallback: int64, rx: { mode: atom, expected: int64, pending: string }, line: int64, logs: int64, warns: int64, errors: int64, other: int64 } {
+    _: boolean <- tell(st.car, (:credit, 1));
+    case wireframe@unframe(st.rx, segment, 4096) of {
+        (:more, rx1: { mode: atom, expected: int64, pending: string }) -> { car: st.car, fallback: st.fallback, rx: rx1, line: st.line, logs: st.logs, warns: st.warns, errors: st.errors, other: st.other };
+        (:frame, f: string, rx2: { mode: atom, expected: int64, pending: string }) -> on_line(line_of(f), { car: st.car, fallback: st.fallback, rx: rx2, line: st.line + 1, logs: st.logs, warns: st.warns, errors: st.errors, other: st.other });
+        (:rejected, why: atom) -> {
+            _: atom <- say_atom("unframe rejected a record: ", why);
+            { car: st.car, fallback: st.fallback, rx: wireframe@fresh(:storage), line: st.line + 1, logs: st.logs, warns: st.warns, errors: st.errors, other: st.other + 1 }
+        }
+    }
+}
+
+// st.line is already the 1-based number of this line.
+fn on_line(l: (:line, string) | (:unreadable, atom), st: { car: dangerous_actor_ref, fallback: int64, rx: { mode: atom, expected: int64, pending: string }, line: int64, logs: int64, warns: int64, errors: int64, other: int64 }) -> { car: dangerous_actor_ref, fallback: int64, rx: { mode: atom, expected: int64, pending: string }, line: int64, logs: int64, warns: int64, errors: int64, other: int64 } {
+    case l of {
+        (:unreadable, why: atom) -> {
+            _: atom <- say_atom("unreadable record: ", why);
+            { car: st.car, fallback: st.fallback, rx: st.rx, line: st.line, logs: st.logs, warns: st.warns, errors: st.errors, other: st.other + 1 }
+        };
+        (:line, text: string) -> case level_of(text) of {
+            :error -> {
+                _: atom <- say_failed(st.line, text);
+                { car: st.car, fallback: st.fallback, rx: st.rx, line: st.line, logs: st.logs, warns: st.warns, errors: st.errors + 1, other: st.other }
+            };
+            :warn -> { car: st.car, fallback: st.fallback, rx: st.rx, line: st.line, logs: st.logs, warns: st.warns + 1, errors: st.errors, other: st.other };
+            :log -> { car: st.car, fallback: st.fallback, rx: st.rx, line: st.line, logs: st.logs + 1, warns: st.warns, errors: st.errors, other: st.other };
+            :unknown -> { car: st.car, fallback: st.fallback, rx: st.rx, line: st.line, logs: st.logs, warns: st.warns, errors: st.errors, other: st.other + 1 }
+        }
+    }
+}
+
+fn on_rx_end(st: { car: dangerous_actor_ref, fallback: int64, rx: { mode: atom, expected: int64, pending: string }, line: int64, logs: int64, warns: int64, errors: int64, other: int64 }) -> { car: dangerous_actor_ref, fallback: int64, rx: { mode: atom, expected: int64, pending: string }, line: int64, logs: int64, warns: int64, errors: int64, other: int64 } {
+    _: atom <- case st.errors == 0 of { true -> say("  (none)"); false -> :ok };
+    _: atom <- say_n("LOG:   ", st.logs);
+    _: atom <- say_n("WARN:  ", st.warns);
+    _: atom <- say_n("ERROR: ", st.errors);
+    _: atom <- case st.other > 0 of { true -> say_n("other: ", st.other); false -> :ok };
+    _: boolean <- tell(st.car, :close);
+    st
+}
+
+fn on_failed(label: string, why: atom, st: { car: dangerous_actor_ref, fallback: int64, rx: { mode: atom, expected: int64, pending: string }, line: int64, logs: int64, warns: int64, errors: int64, other: int64 }) -> { car: dangerous_actor_ref, fallback: int64, rx: { mode: atom, expected: int64, pending: string }, line: int64, logs: int64, warns: int64, errors: int64, other: int64 } {
+    _: atom <- say_atom(label, why);
+    _: boolean <- tell(st.car, :close);
+    st
+}
+
+// fallback says which declaration the owner is on: 0 the first (`logfile`), 1 the second
+// (`logfile_here`) with the first carrier's (:link_down, :closed) still to come, 2 the second with
+// that message already seen.
+//
+// :medium from the first carrier means its path did not resolve: the program was started somewhere
+// other than the silica-examples root, most likely inside the project folder. That carrier is closed
+// and a second carrier opens `logfile_here`. The first carrier's :closed is skipped; any other
+// :closed is the end of a normal run. Any other failure is reported, the carrier is closed and the
+// program ends with status 1.
+fn on_link_down(why: atom, st: { car: dangerous_actor_ref, fallback: int64, rx: { mode: atom, expected: int64, pending: string }, line: int64, logs: int64, warns: int64, errors: int64, other: int64 }) -> { car: dangerous_actor_ref, fallback: int64, rx: { mode: atom, expected: int64, pending: string }, line: int64, logs: int64, warns: int64, errors: int64, other: int64 } {
+    case why == :closed of {
+        true -> case st.fallback == 1 of {
+            true -> { car: st.car, fallback: 2, rx: st.rx, line: st.line, logs: st.logs, warns: st.warns, errors: st.errors, other: st.other };
+            false -> {
+                _: boolean <- stop(0);
+                st
+            }
+        };
+        false -> case why == :medium and st.fallback == 0 of {
+            true -> {
+                _: boolean <- tell(st.car, :close);
+                { car: open_here(), fallback: 1, rx: st.rx, line: st.line, logs: st.logs, warns: st.warns, errors: st.errors, other: st.other }
+            };
+            false -> {
+                _: atom <- say_atom("the store could not be opened: ", why);
+                _: boolean <- tell(st.car, :close);
+                _: boolean <- stop(1);
+                st
+            }
+        }
+    }
+}
+
+// A carrier on `logfile_here`, opened with this actor as its owner.
+fn open_here() -> dangerous_actor_ref {
+    sequence proc[concurrency]
+        car: dangerous_actor_ref <- spawn_dangerous_carrier(logfile_here, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: boolean <- cast(car, (:open, self(), "") impl ActorMessage {})
+    produces
+        pure car
+    end
+}
+
+fn owner(msg: (:link_up, string) | (:log, int64, int64, int64) | (:tx_credit, int64) | (:synced, int64) | (:rx, string) | (:rx_end, int64) | (:tx_failed, atom) | (:read_failed, atom) | (:link_down, atom), state: { car: dangerous_actor_ref, fallback: int64, rx: { mode: atom, expected: int64, pending: string }, line: int64, logs: int64, warns: int64, errors: int64, other: int64 }) -> (:no_reply, { car: dangerous_actor_ref, fallback: int64, rx: { mode: atom, expected: int64, pending: string }, line: int64, logs: int64, warns: int64, errors: int64, other: int64 }) {
+    case msg of {
+        (:link_up, _info: string) -> (:no_reply, state);
+        (:log, oldest: int64, nx: int64, _capacity: int64) -> (:no_reply, on_log(oldest, nx, state));
+        (:tx_credit, _n: int64) -> (:no_reply, state);
+        (:synced, _s: int64) -> (:no_reply, state);
+        (:rx, segment: string) -> (:no_reply, on_rx(segment, state));
+        (:rx_end, _next: int64) -> (:no_reply, on_rx_end(state));
+        (:tx_failed, _why: atom) -> (:no_reply, state);
+        (:read_failed, why: atom) -> (:no_reply, on_failed("the replay failed: ", why, state));
+        (:link_down, why: atom) -> (:no_reply, on_link_down(why, state))
+    }
+}
+
+// How many memory regions to dump when an actor fails (none here). The runtime links against this.
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// The compiler requires every program that spawns actors to register a failure reporter first
+// (spec §15.4.13.4). This one counts the reports and ignores them.
+fn reporter(_report: string, state: int64) -> (:no_reply, int64) {
+    (:no_reply, state + 1)
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        rep: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: atom <- register_failure_reporter(rep);
+        car: dangerous_actor_ref <- spawn_dangerous_carrier(logfile, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        own: actor_ref <- spawn({ car: car, fallback: 0, rx: wireframe@fresh(:storage), line: 0, logs: 0, warns: 0, errors: 0, other: 0 }, owner, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: boolean <- cast(car, (:open, own, "") impl ActorMessage {});
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}
