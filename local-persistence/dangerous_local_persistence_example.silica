@@ -1,0 +1,261 @@
+// Local persistence: a log kept in a file on this host.
+//
+//   $ silica run local-persistence        (from the silica-examples root; run it again to see it grow)
+//
+// A log kept in a file on this host (transport_serialization_design.md §6.8, the
+// (:store) carrier kind on the hosted (:backing) medium). Based on the trial
+// trials/transport_addition/app_transport_store_backing/dangerous_store_backing_restart.silica.
+//
+// Each run opens the log, appends three records, makes them durable, replays the whole log from its
+// oldest record and closes it. The log is kept between runs, so the second run replays six records,
+// the third nine, and so on until the 8192 bytes are used: the retention is :stop, so a full log
+// refuses the append with (:tx_failed, ...) and the records already there are still replayed.
+//
+// A program that uses a dangerous carrier is itself named dangerous_ (E4021).
+module dangerous_local_persistence_example;
+
+use Carrier;
+use dangerous_store;
+use dangerous_store_backing_carrier;
+
+// The log: kind (:store), on the file __ignore__journal.sildat, 8192 bytes (two 4096-byte blocks),
+// retention :stop (:ring overwrites the oldest block instead; :trim releases records when the owner
+// says so). (:store) (:memory, 8192, :stop) is the same log held in memory: nothing is kept between
+// runs. The carrier creates the file on the first run.
+//
+// A backing path is relative to the directory the program runs in. `journal` is the path from the
+// silica-examples root (`silica run local-persistence`); `journal_here` is the same file from inside
+// the project folder (`silica run .`). The program opens `journal` first and falls back to
+// `journal_here` when that path does not resolve (on_link_down).
+carried_on journal: (:store) (:backing, "local-persistence/__ignore__journal.sildat", 8192, :stop);
+carried_on journal_here: (:store) (:backing, "__ignore__journal.sildat", 8192, :stop);
+
+// ---- Printing ----
+
+fn say_text(label: string, s: string) -> atom {
+    sequence proc[device_io]
+        _: atom <- print(label);
+        o: atom <- println(s)
+    produces
+        pure o
+    end
+}
+
+fn say_n(label: string, n: int64) -> atom {
+    sequence proc[device_io]
+        _: atom <- print(label);
+        _: atom <- print_int64(n);
+        o: atom <- println("")
+    produces
+        pure o
+    end
+}
+
+fn say_atom(label: string, a: atom) -> atom {
+    sequence proc[device_io]
+        _: atom <- print(label);
+        _: atom <- print_atom(a);
+        o: atom <- println("")
+    produces
+        pure o
+    end
+}
+
+fn say_log(oldest: int64, nx: int64, capacity: int64) -> atom {
+    sequence proc[device_io]
+        _: atom <- print("log oldest=");
+        _: atom <- print_int64(oldest);
+        _: atom <- print(" next=");
+        _: atom <- print_int64(nx);
+        _: atom <- print(" capacity=");
+        _: atom <- print_int64(capacity);
+        o: atom <- println("")
+    produces
+        pure o
+    end
+}
+
+// ---- What the owner asks of the carrier: every request is a cast ----
+
+// Append one record. The carrier answers (:tx_credit, n) or (:tx_failed, why).
+fn tx(car: dangerous_actor_ref, s: string) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast(car, (:tx, s, self()) impl ActorMessage {})
+    produces
+        pure r
+    end
+}
+
+// Make everything appended so far durable. The carrier answers (:synced, n): records below n are safe.
+fn ask_sync(car: dangerous_actor_ref) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast(car, :sync impl ActorMessage {})
+    produces
+        pure r
+    end
+}
+
+// Replay from record number `from`. Records arrive as (:rx, record), then (:rx_end, n).
+fn ask_read(car: dangerous_actor_ref, from: int64) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast(car, (:read, from) impl ActorMessage {})
+    produces
+        pure r
+    end
+}
+
+// Allow n more replayed records to be delivered: the carrier sends none without credit.
+fn give_credit(car: dangerous_actor_ref, n: int64) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast(car, (:credit, n) impl ActorMessage {})
+    produces
+        pure r
+    end
+}
+
+// Close the log. The carrier answers (:link_down, :closed) and ends.
+fn ask_close(car: dangerous_actor_ref) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast(car, :close impl ActorMessage {})
+    produces
+        pure r
+    end
+}
+
+fn leave(code: int64) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast_exit(code)
+    produces
+        pure r
+    end
+}
+
+// ---- What the owner does with each answer ----
+
+// The log as the carrier found it: `oldest` is the first record still held, `nx` the number the next
+// record will get. Three records are appended and a sync is asked for.
+fn on_log(oldest: int64, nx: int64, capacity: int64, car: dangerous_actor_ref) -> boolean {
+    _: atom <- say_log(oldest, nx, capacity);
+    _: boolean <- tx(car, "started");
+    _: boolean <- tx(car, "reading 21");
+    _: boolean <- tx(car, "reading 22");
+    ask_sync(car)
+}
+
+// The records are durable: replay the log from its beginning.
+fn on_synced(n: int64, car: dangerous_actor_ref) -> boolean {
+    _: atom <- say_n("synced ", n);
+    _: boolean <- ask_read(car, 0);
+    give_credit(car, 1000)
+}
+
+fn on_rx_end(n: int64, car: dangerous_actor_ref) -> boolean {
+    _: atom <- say_n("rx_end ", n);
+    ask_close(car)
+}
+
+fn on_read_failed(why: atom, car: dangerous_actor_ref) -> boolean {
+    _: atom <- say_atom("read_failed ", why);
+    ask_close(car)
+}
+
+// A carrier on `journal_here`, opened with this actor as its owner.
+fn open_here() -> dangerous_actor_ref {
+    sequence proc[concurrency]
+        car: dangerous_actor_ref <- spawn_dangerous_carrier(journal_here, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: boolean <- cast(car, (:open, self(), "") impl ActorMessage {})
+    produces
+        pure car
+    end
+}
+
+// The carrier's last message. fallback says which declaration the owner is on: 0 the first
+// (`journal`), 1 the second (`journal_here`) with the first carrier's (:link_down, :closed) still to
+// come, 2 the second with that message already seen, 3 failed: the log could not be opened and the
+// program ends with status 1 once its carrier has closed.
+//
+// :medium from the first carrier means its path did not resolve: the program was started somewhere
+// other than the silica-examples root, most likely inside the project folder. That carrier is closed
+// and a second carrier opens `journal_here`. The first carrier's :closed is skipped; any other
+// :closed is the end of a normal run (status 0). Any other failure (:in_use, :mismatch, or :medium
+// on the second path) is reported and the carrier is closed; its :closed then ends the program with
+// status 1.
+fn on_link_down(why: atom, st: { car: dangerous_actor_ref, fallback: int64 }) -> { car: dangerous_actor_ref, fallback: int64 } {
+    case why == :closed of {
+        true -> case st.fallback == 1 of {
+            true -> { car: st.car, fallback: 2 };
+            false -> case st.fallback == 3 of {
+                true -> {
+                    _: boolean <- leave(1);
+                    st
+                };
+                false -> {
+                    _: atom <- say_atom("link_down ", why);
+                    _: boolean <- leave(0);
+                    st
+                }
+            }
+        };
+        false -> case why == :medium and st.fallback == 0 of {
+            true -> {
+                _: boolean <- ask_close(st.car);
+                { car: open_here(), fallback: 1 }
+            };
+            false -> {
+                _: atom <- say_atom("the log could not be opened: ", why);
+                _: boolean <- ask_close(st.car);
+                { car: st.car, fallback: 3 }
+            }
+        }
+    }
+}
+
+fn told(_done: boolean, st: { car: dangerous_actor_ref, fallback: int64 }) -> (:no_reply, { car: dangerous_actor_ref, fallback: int64 }) {
+    (:no_reply, st)
+}
+
+fn noted(_printed: atom, st: { car: dangerous_actor_ref, fallback: int64 }) -> (:no_reply, { car: dangerous_actor_ref, fallback: int64 }) {
+    (:no_reply, st)
+}
+
+// The owner: the actor named in :open. Everything the carrier says comes here. Its state is the
+// carrier's reference and which declaration it is on (fallback, see on_link_down).
+fn owner(msg: (:link_up, string) | (:log, int64, int64, int64) | (:tx_credit, int64) | (:synced, int64) | (:rx, string) | (:rx_end, int64) | (:tx_failed, atom) | (:read_failed, atom) | (:link_down, atom), st: { car: dangerous_actor_ref, fallback: int64 }) -> (:no_reply, { car: dangerous_actor_ref, fallback: int64 }) {
+    case msg of {
+        (:link_up, info: string) -> noted(say_text("link_up ", info), st);
+        (:log, oldest: int64, nx: int64, capacity: int64) -> told(on_log(oldest, nx, capacity, st.car), st);
+        (:tx_credit, _n: int64) -> (:no_reply, st);
+        (:synced, n: int64) -> told(on_synced(n, st.car), st);
+        (:rx, record: string) -> noted(say_text("rx ", record), st);
+        (:rx_end, n2: int64) -> told(on_rx_end(n2, st.car), st);
+        (:tx_failed, why: atom) -> noted(say_atom("tx_failed ", why), st);
+        (:read_failed, why2: atom) -> told(on_read_failed(why2, st.car), st);
+        (:link_down, why3: atom) -> (:no_reply, on_link_down(why3, st))
+    }
+}
+
+// How many memory regions to dump when an actor fails (none here). The runtime links against this.
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// The compiler requires every program that spawns actors to register a failure reporter first
+// (spec §15.4.13.4). This one counts the reports and ignores them.
+fn reporter(_report: string, state: int64) -> (:no_reply, int64) {
+    (:no_reply, state + 1)
+}
+
+// Register the failure reporter, start the carrier from the declaration, start the owner with the
+// carrier's reference, open the log for the owner and wait for the program's exit code.
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        rep: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: atom <- register_failure_reporter(rep);
+        car: dangerous_actor_ref <- spawn_dangerous_carrier(journal, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        own: actor_ref <- spawn({ car: car, fallback: 0 }, owner, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: boolean <- cast(car, (:open, own, "") impl ActorMessage {});
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}
