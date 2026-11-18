@@ -1,0 +1,49 @@
+# Builds, runs and checks every example on each pull request, with the latest silica CLI and
+# the latest released Silica compiler, on each platform a compiler is released for.
+#
+# Examples are found, not listed: any top-level folder holding a .silica file is one, so adding
+# an example needs no change here. See .github/scripts/run-examples.sh for what "works" means
+# and how an example's own ci.sh adds setup or checks.
+name: Examples
+
+on:
+  pull_request:
+  workflow_dispatch:  # run by hand, e.g. after a new compiler release
+
+permissions:
+  contents: read
+
+concurrency:
+  group: examples-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  examples:
+    name: Examples (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-applesilicon
+            runner: macos-latest
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+    env:
+      GITHUB_TOKEN: ${{ github.token }}  # raises the GitHub API rate limit for the compiler lookup
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install the silica CLI and the latest compiler
+        run: |
+          curl -fsSL https://github.com/Silica-Language-and-Compiler/silica-cli/releases/latest/download/install.sh | bash
+          echo "$HOME/.silica/bin" >> "$GITHUB_PATH"
+
+      - name: Show versions
+        run: silica version
+
+      - name: Build, run and check every example
+        run: .github/scripts/run-examples.sh
