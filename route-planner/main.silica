@@ -1,0 +1,296 @@
+// Route planner: shortest routes and a minimum spanning tree over a small road network.
+//
+// The network is the standard library's live weighted undirected graph (graph_weighted_undirected):
+// 16 cities, numbered 0 to 15, and 25 roads whose weight is their length in tens of kilometres.
+// Both algorithms are one best-first search over the standard library's PriorityQueue (the
+// Brodal-Okasaki queue of brodal_okasaki_priority), written as recursion with no loops:
+//
+//   Dijkstra: the queue is ordered by the total distance from the start city.
+//   Prim:     the queue is ordered by the length of the single road that joins a city to the tree.
+//
+// A queue entry is (priority, city * 100 + the city it came from); 99 means "came from nowhere".
+// A settled city is remembered as one int64 in a List: priority * 10000 + city * 100 + came_from.
+// A queue entry is dropped when its city is already settled (lazy deletion).
+//
+// The graph and the queue are values of the library's record types. Silica has no generics, so the
+// types are spelled out in full, as they are in the library's own trials.
+//
+//   silica run route-planner
+
+use graph_weighted_undirected;
+use brodal_okasaki_priority;
+
+// Must stay the first function in the unit: the emitter numbers the atoms :less, :equal and
+// :greater in first-use order and the library expects that order.
+fn cmp_i64(a: int64, b: int64) -> :less | :equal | :greater {
+    case a < b of {
+        true -> :less;
+        false -> case a == b of {
+            true -> :equal;
+            false -> :greater
+        }
+    }
+}
+
+// A distinct copy for the queue's item order: ordering identity is function-value identity.
+fn cmp_item(a: int64, b: int64) -> :less | :equal | :greater {
+    case a < b of {
+        true -> :less;
+        false -> case a == b of {
+            true -> :equal;
+            false -> :greater
+        }
+    }
+}
+
+fn weight_of_data(w: int64) -> int64 {
+    w
+}
+
+// ---- the road network ----
+
+fn city(i: int64) -> string {
+    case i of {
+        0 -> "Lisbon";
+        1 -> "Madrid";
+        2 -> "Barcelona";
+        3 -> "Lyon";
+        4 -> "Paris";
+        5 -> "Brussels";
+        6 -> "Amsterdam";
+        7 -> "Cologne";
+        8 -> "Berlin";
+        9 -> "Munich";
+        10 -> "Zurich";
+        11 -> "Milan";
+        12 -> "Rome";
+        13 -> "Vienna";
+        14 -> "Prague";
+        _: int64 -> "Warsaw"
+    }
+}
+
+// Road i as a * 100000 + b * 1000 + length.
+fn road(i: int64) -> int64 {
+    case i of {
+        0 -> 1062;
+        1 -> 102062;
+        2 -> 104130;
+        3 -> 203064;
+        4 -> 304046;
+        5 -> 310041;
+        6 -> 311044;
+        7 -> 405031;
+        8 -> 506021;
+        9 -> 507021;
+        10 -> 607025;
+        11 -> 608065;
+        12 -> 708057;
+        13 -> 709058;
+        14 -> 1009031;
+        15 -> 1011028;
+        16 -> 1112057;
+        17 -> 1209070;
+        18 -> 913040;
+        19 -> 914038;
+        20 -> 814028;
+        21 -> 1413025;
+        22 -> 815057;
+        23 -> 1415052;
+        _: int64 -> 1315068
+    }
+}
+
+fn road_count() -> int64 {
+    25
+}
+
+fn new_graph() -> { root: ref?(L, normal, (int64, ref?(L, normal, (int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_node: fn(int64, int64) -> :less | :equal | :greater, compare_edge_data: fn(int64, int64) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, edge_weight: fn(int64) -> int64, compare_weight: fn(int64, int64) -> :less | :equal | :greater, compare_item: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, node_count: int64, edge_count: int64, adjacency_entry_count: int64, compare_node_ordering_token: int64, compare_edge_data_ordering_token: int64, edge_weight_ordering_token: int64, compare_weight_ordering_token: int64 } {
+    graph_weighted_undirected@empty({ compare_node: cmp_i64, compare_edge_data: cmp_i64, edge_weight: weight_of_data, compare_weight: cmp_i64 })
+}
+
+// An undirected road is stored as two directional views of one edge.
+fn add_road(g: { root: ref?(L, normal, (int64, ref?(L, normal, (int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_node: fn(int64, int64) -> :less | :equal | :greater, compare_edge_data: fn(int64, int64) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, edge_weight: fn(int64) -> int64, compare_weight: fn(int64, int64) -> :less | :equal | :greater, compare_item: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, node_count: int64, edge_count: int64, adjacency_entry_count: int64, compare_node_ordering_token: int64, compare_edge_data_ordering_token: int64, edge_weight_ordering_token: int64, compare_weight_ordering_token: int64 }, e: int64) -> { root: ref?(L, normal, (int64, ref?(L, normal, (int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_node: fn(int64, int64) -> :less | :equal | :greater, compare_edge_data: fn(int64, int64) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, edge_weight: fn(int64) -> int64, compare_weight: fn(int64, int64) -> :less | :equal | :greater, compare_item: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, node_count: int64, edge_count: int64, adjacency_entry_count: int64, compare_node_ordering_token: int64, compare_edge_data_ordering_token: int64, edge_weight_ordering_token: int64, compare_weight_ordering_token: int64 } {
+    r: :unchanged | (:inserted, { root: ref?(L, normal, (int64, ref?(L, normal, (int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_node: fn(int64, int64) -> :less | :equal | :greater, compare_edge_data: fn(int64, int64) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, edge_weight: fn(int64) -> int64, compare_weight: fn(int64, int64) -> :less | :equal | :greater, compare_item: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, node_count: int64, edge_count: int64, adjacency_entry_count: int64, compare_node_ordering_token: int64, compare_edge_data_ordering_token: int64, edge_weight_ordering_token: int64, compare_weight_ordering_token: int64 }) | (:replaced, { root: ref?(L, normal, (int64, ref?(L, normal, (int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_node: fn(int64, int64) -> :less | :equal | :greater, compare_edge_data: fn(int64, int64) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, edge_weight: fn(int64) -> int64, compare_weight: fn(int64, int64) -> :less | :equal | :greater, compare_item: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, node_count: int64, edge_count: int64, adjacency_entry_count: int64, compare_node_ordering_token: int64, compare_edge_data_ordering_token: int64, edge_weight_ordering_token: int64, compare_weight_ordering_token: int64 }) <- graph_weighted_undirected@add_edge(g, e / 100000, (e / 1000) % 100, e % 1000);
+    r_graph: { root: ref?(L, normal, (int64, ref?(L, normal, (int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_node: fn(int64, int64) -> :less | :equal | :greater, compare_edge_data: fn(int64, int64) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, edge_weight: fn(int64) -> int64, compare_weight: fn(int64, int64) -> :less | :equal | :greater, compare_item: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, node_count: int64, edge_count: int64, adjacency_entry_count: int64, compare_node_ordering_token: int64, compare_edge_data_ordering_token: int64, edge_weight_ordering_token: int64, compare_weight_ordering_token: int64 } <- case r of {
+        :unchanged -> g;
+        (:inserted, v_inserted: { root: ref?(L, normal, (int64, ref?(L, normal, (int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_node: fn(int64, int64) -> :less | :equal | :greater, compare_edge_data: fn(int64, int64) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, edge_weight: fn(int64) -> int64, compare_weight: fn(int64, int64) -> :less | :equal | :greater, compare_item: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, node_count: int64, edge_count: int64, adjacency_entry_count: int64, compare_node_ordering_token: int64, compare_edge_data_ordering_token: int64, edge_weight_ordering_token: int64, compare_weight_ordering_token: int64 }) -> v_inserted;
+        (:replaced, v_replaced: { root: ref?(L, normal, (int64, ref?(L, normal, (int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_node: fn(int64, int64) -> :less | :equal | :greater, compare_edge_data: fn(int64, int64) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, edge_weight: fn(int64) -> int64, compare_weight: fn(int64, int64) -> :less | :equal | :greater, compare_item: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, node_count: int64, edge_count: int64, adjacency_entry_count: int64, compare_node_ordering_token: int64, compare_edge_data_ordering_token: int64, edge_weight_ordering_token: int64, compare_weight_ordering_token: int64 }) -> v_replaced
+    };
+    r_graph
+}
+
+fn add_roads(g: { root: ref?(L, normal, (int64, ref?(L, normal, (int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_node: fn(int64, int64) -> :less | :equal | :greater, compare_edge_data: fn(int64, int64) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, edge_weight: fn(int64) -> int64, compare_weight: fn(int64, int64) -> :less | :equal | :greater, compare_item: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, node_count: int64, edge_count: int64, adjacency_entry_count: int64, compare_node_ordering_token: int64, compare_edge_data_ordering_token: int64, edge_weight_ordering_token: int64, compare_weight_ordering_token: int64 }, i: int64) -> { root: ref?(L, normal, (int64, ref?(L, normal, (int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_node: fn(int64, int64) -> :less | :equal | :greater, compare_edge_data: fn(int64, int64) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, edge_weight: fn(int64) -> int64, compare_weight: fn(int64, int64) -> :less | :equal | :greater, compare_item: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, node_count: int64, edge_count: int64, adjacency_entry_count: int64, compare_node_ordering_token: int64, compare_edge_data_ordering_token: int64, edge_weight_ordering_token: int64, compare_weight_ordering_token: int64 } {
+    case i == road_count() of {
+        true -> g;
+        false -> add_roads(add_road(g, road(i)), i + 1)
+    }
+}
+
+// ---- lists of settled cities ----
+
+fn cons(x: int64, rest: List[int64, mem(normal)]) -> List[int64, mem(normal)] {
+    sequence proc[mem(normal)]
+        out: List[int64, mem(normal)] <- prepend[int64, mem(normal)](x, rest)
+    produces
+        pure out
+    end
+}
+
+fn nil() -> List[int64, mem(normal)] {
+    sequence proc[mem(normal)]
+        out: List[int64, mem(normal)] <- empty[int64, mem(normal)]()
+    produces
+        pure out
+    end
+}
+
+// The settled entry of a city, or 0 when it is not settled yet (an entry is never 0).
+fn find(settled: List[int64, mem(normal)], node: int64) -> int64 {
+    case settled.is_nil of {
+        true -> 0;
+        false -> {
+            e: int64 <- settled.head;
+            case (e / 100) % 100 == node of {
+                true -> e;
+                false -> find(settled.tail, node)
+            }
+        }
+    }
+}
+
+fn total_weight(settled: List[int64, mem(normal)]) -> int64 {
+    case settled.is_nil of {
+        true -> 0;
+        false -> {
+            e: int64 <- settled.head;
+            e / 10000 + total_weight(settled.tail)
+        }
+    }
+}
+
+// Every settled city except the start was reached by one road.
+fn road_total(settled: List[int64, mem(normal)]) -> int64 {
+    case settled.is_nil of {
+        true -> 0;
+        false -> {
+            e: int64 <- settled.head;
+            case e % 100 == 99 of {
+                true -> road_total(settled.tail);
+                false -> 1 + road_total(settled.tail)
+            }
+        }
+    }
+}
+
+// ---- best-first search ----
+
+fn new_queue() -> { compare_priority: fn(int64, int64) -> :less | :equal | :greater, compare_item: fn(int64, int64) -> :less | :equal | :greater, compare_key: fn(int64, int64) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, heap: { root: ref?(L, normal, ({ priority: int64, value: int64, priority_order: fn(int64, int64) -> :less | :equal | :greater, value_order: fn(int64, int64) -> :less | :equal | :greater }, int64, int64, ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), count: int64, max_oriented: boolean, compare_item: fn({ priority: int64, value: int64, priority_order: fn(int64, int64) -> :less | :equal | :greater, value_order: fn(int64, int64) -> :less | :equal | :greater }, { priority: int64, value: int64, priority_order: fn(int64, int64) -> :less | :equal | :greater, value_order: fn(int64, int64) -> :less | :equal | :greater }) -> :less | :equal | :greater, specialization_key: int64, compare_item_ordering_bundle: int64 }, specialization_key: int64, compare_priority_ordering_bundle: int64, compare_item_ordering_bundle: int64 } {
+    brodal_okasaki_priority@empty({ compare_priority: cmp_i64, compare_item: cmp_item })
+}
+
+// Queues every road out of a city. base is the distance already travelled (0 for Prim).
+fn push_roads(q: { compare_priority: fn(int64, int64) -> :less | :equal | :greater, compare_item: fn(int64, int64) -> :less | :equal | :greater, compare_key: fn(int64, int64) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, heap: { root: ref?(L, normal, ({ priority: int64, value: int64, priority_order: fn(int64, int64) -> :less | :equal | :greater, value_order: fn(int64, int64) -> :less | :equal | :greater }, int64, int64, ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), count: int64, max_oriented: boolean, compare_item: fn({ priority: int64, value: int64, priority_order: fn(int64, int64) -> :less | :equal | :greater, value_order: fn(int64, int64) -> :less | :equal | :greater }, { priority: int64, value: int64, priority_order: fn(int64, int64) -> :less | :equal | :greater, value_order: fn(int64, int64) -> :less | :equal | :greater }) -> :less | :equal | :greater, specialization_key: int64, compare_item_ordering_bundle: int64 }, specialization_key: int64, compare_priority_ordering_bundle: int64, compare_item_ordering_bundle: int64 }, roads: List[{ to: int64, data: int64 }, mem(normal)], base: int64, from: int64) -> { compare_priority: fn(int64, int64) -> :less | :equal | :greater, compare_item: fn(int64, int64) -> :less | :equal | :greater, compare_key: fn(int64, int64) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, heap: { root: ref?(L, normal, ({ priority: int64, value: int64, priority_order: fn(int64, int64) -> :less | :equal | :greater, value_order: fn(int64, int64) -> :less | :equal | :greater }, int64, int64, ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), count: int64, max_oriented: boolean, compare_item: fn({ priority: int64, value: int64, priority_order: fn(int64, int64) -> :less | :equal | :greater, value_order: fn(int64, int64) -> :less | :equal | :greater }, { priority: int64, value: int64, priority_order: fn(int64, int64) -> :less | :equal | :greater, value_order: fn(int64, int64) -> :less | :equal | :greater }) -> :less | :equal | :greater, specialization_key: int64, compare_item_ordering_bundle: int64 }, specialization_key: int64, compare_priority_ordering_bundle: int64, compare_item_ordering_bundle: int64 } {
+    case roads.is_nil of {
+        true -> q;
+        false -> {
+            w: { to: int64, data: int64 } <- roads.head;
+            push_roads(brodal_okasaki_priority@push_priority(q, base + w.data, w.to * 100 + from), roads.tail, base, from)
+        }
+    }
+}
+
+// Pops the cheapest entry until the queue is empty. cumulative is true for Dijkstra, false for Prim.
+fn search(g: { root: ref?(L, normal, (int64, ref?(L, normal, (int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_node: fn(int64, int64) -> :less | :equal | :greater, compare_edge_data: fn(int64, int64) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, edge_weight: fn(int64) -> int64, compare_weight: fn(int64, int64) -> :less | :equal | :greater, compare_item: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, node_count: int64, edge_count: int64, adjacency_entry_count: int64, compare_node_ordering_token: int64, compare_edge_data_ordering_token: int64, edge_weight_ordering_token: int64, compare_weight_ordering_token: int64 }, q: { compare_priority: fn(int64, int64) -> :less | :equal | :greater, compare_item: fn(int64, int64) -> :less | :equal | :greater, compare_key: fn(int64, int64) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, heap: { root: ref?(L, normal, ({ priority: int64, value: int64, priority_order: fn(int64, int64) -> :less | :equal | :greater, value_order: fn(int64, int64) -> :less | :equal | :greater }, int64, int64, ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), count: int64, max_oriented: boolean, compare_item: fn({ priority: int64, value: int64, priority_order: fn(int64, int64) -> :less | :equal | :greater, value_order: fn(int64, int64) -> :less | :equal | :greater }, { priority: int64, value: int64, priority_order: fn(int64, int64) -> :less | :equal | :greater, value_order: fn(int64, int64) -> :less | :equal | :greater }) -> :less | :equal | :greater, specialization_key: int64, compare_item_ordering_bundle: int64 }, specialization_key: int64, compare_priority_ordering_bundle: int64, compare_item_ordering_bundle: int64 }, settled: List[int64, mem(normal)], cumulative: boolean) -> List[int64, mem(normal)] {
+    p: { queue: { compare_priority: fn(int64, int64) -> :less | :equal | :greater, compare_item: fn(int64, int64) -> :less | :equal | :greater, compare_key: fn(int64, int64) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, heap: { root: ref?(L, normal, ({ priority: int64, value: int64, priority_order: fn(int64, int64) -> :less | :equal | :greater, value_order: fn(int64, int64) -> :less | :equal | :greater }, int64, int64, ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), count: int64, max_oriented: boolean, compare_item: fn({ priority: int64, value: int64, priority_order: fn(int64, int64) -> :less | :equal | :greater, value_order: fn(int64, int64) -> :less | :equal | :greater }, { priority: int64, value: int64, priority_order: fn(int64, int64) -> :less | :equal | :greater, value_order: fn(int64, int64) -> :less | :equal | :greater }) -> :less | :equal | :greater, specialization_key: int64, compare_item_ordering_bundle: int64 }, specialization_key: int64, compare_priority_ordering_bundle: int64, compare_item_ordering_bundle: int64 }, status: :not_found | :found, priority: int64, value: int64 }
+        <- brodal_okasaki_priority@pop_priority(q, 0, 0);
+    case p.status of {
+        :not_found -> settled;
+        :found -> visit(g, p.queue, settled, cumulative, p.priority, p.value)
+    }
+}
+
+fn visit(g: { root: ref?(L, normal, (int64, ref?(L, normal, (int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_node: fn(int64, int64) -> :less | :equal | :greater, compare_edge_data: fn(int64, int64) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, edge_weight: fn(int64) -> int64, compare_weight: fn(int64, int64) -> :less | :equal | :greater, compare_item: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, node_count: int64, edge_count: int64, adjacency_entry_count: int64, compare_node_ordering_token: int64, compare_edge_data_ordering_token: int64, edge_weight_ordering_token: int64, compare_weight_ordering_token: int64 }, q: { compare_priority: fn(int64, int64) -> :less | :equal | :greater, compare_item: fn(int64, int64) -> :less | :equal | :greater, compare_key: fn(int64, int64) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, heap: { root: ref?(L, normal, ({ priority: int64, value: int64, priority_order: fn(int64, int64) -> :less | :equal | :greater, value_order: fn(int64, int64) -> :less | :equal | :greater }, int64, int64, ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), count: int64, max_oriented: boolean, compare_item: fn({ priority: int64, value: int64, priority_order: fn(int64, int64) -> :less | :equal | :greater, value_order: fn(int64, int64) -> :less | :equal | :greater }, { priority: int64, value: int64, priority_order: fn(int64, int64) -> :less | :equal | :greater, value_order: fn(int64, int64) -> :less | :equal | :greater }) -> :less | :equal | :greater, specialization_key: int64, compare_item_ordering_bundle: int64 }, specialization_key: int64, compare_priority_ordering_bundle: int64, compare_item_ordering_bundle: int64 }, settled: List[int64, mem(normal)], cumulative: boolean, priority: int64, entry: int64) -> List[int64, mem(normal)] {
+    case find(settled, entry / 100) == 0 of {
+        true -> search(g, push_roads(q, graph_weighted_undirected@weighted_neighbors(g, entry / 100), base_of(cumulative, priority), entry / 100), cons(priority * 10000 + entry, settled), cumulative);
+        false -> search(g, q, settled, cumulative)
+    }
+}
+
+fn base_of(cumulative: boolean, priority: int64) -> int64 {
+    case cumulative of {
+        true -> priority;
+        false -> 0
+    }
+}
+
+// Starts from one city: its own entry has priority 0 and came_from 99.
+fn run_from(g: { root: ref?(L, normal, (int64, ref?(L, normal, (int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_node: fn(int64, int64) -> :less | :equal | :greater, compare_edge_data: fn(int64, int64) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, edge_weight: fn(int64) -> int64, compare_weight: fn(int64, int64) -> :less | :equal | :greater, compare_item: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, node_count: int64, edge_count: int64, adjacency_entry_count: int64, compare_node_ordering_token: int64, compare_edge_data_ordering_token: int64, edge_weight_ordering_token: int64, compare_weight_ordering_token: int64 }, start: int64, cumulative: boolean) -> List[int64, mem(normal)] {
+    search(g, brodal_okasaki_priority@push_priority(new_queue(), 0, start * 100 + 99), nil(), cumulative)
+}
+
+fn shortest_paths(g: { root: ref?(L, normal, (int64, ref?(L, normal, (int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_node: fn(int64, int64) -> :less | :equal | :greater, compare_edge_data: fn(int64, int64) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, edge_weight: fn(int64) -> int64, compare_weight: fn(int64, int64) -> :less | :equal | :greater, compare_item: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, node_count: int64, edge_count: int64, adjacency_entry_count: int64, compare_node_ordering_token: int64, compare_edge_data_ordering_token: int64, edge_weight_ordering_token: int64, compare_weight_ordering_token: int64 }, start: int64) -> List[int64, mem(normal)] {
+    run_from(g, start, true)
+}
+
+fn spanning_tree(g: { root: ref?(L, normal, (int64, ref?(L, normal, (int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_node: fn(int64, int64) -> :less | :equal | :greater, compare_edge_data: fn(int64, int64) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, edge_weight: fn(int64) -> int64, compare_weight: fn(int64, int64) -> :less | :equal | :greater, compare_item: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, node_count: int64, edge_count: int64, adjacency_entry_count: int64, compare_node_ordering_token: int64, compare_edge_data_ordering_token: int64, edge_weight_ordering_token: int64, compare_weight_ordering_token: int64 }) -> List[int64, mem(normal)] {
+    run_from(g, 0, false)
+}
+
+// ---- output ----
+
+// Prints every city before this one on its route, each followed by " -> ".
+fn print_before(settled: List[int64, mem(normal)], node: int64) -> atom {
+    prev: int64 <- find(settled, node) % 100;
+    case prev == 99 of {
+        true -> :ok;
+        false -> {
+            sequence proc[device_io]
+                _: atom <- print_before(settled, prev);
+                _: atom <- print(city(prev));
+                _: atom <- print(" -> ")
+            produces
+                pure :ok
+            end
+        }
+    }
+}
+
+fn show_route(settled: List[int64, mem(normal)], to: int64) -> atom {
+    sequence proc[device_io]
+        _: atom <- print_before(settled, to);
+        _: atom <- print(city(to));
+        _: atom <- print(" (distance ");
+        _: atom <- print_int64(find(settled, to) / 10000);
+        _: atom <- println(")")
+    produces
+        pure :ok
+    end
+}
+
+fn show_tree(tree: List[int64, mem(normal)]) -> atom {
+    sequence proc[device_io]
+        _: atom <- print("minimum spanning tree: ");
+        _: atom <- print_int64(road_total(tree));
+        _: atom <- print(" roads, total weight ");
+        _: atom <- print_int64(total_weight(tree));
+        _: atom <- println("")
+    produces
+        pure :ok
+    end
+}
+
+fn main() -> atom {
+    sequence proc[device_io]
+        g: { root: ref?(L, normal, (int64, ref?(L, normal, (int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_node: fn(int64, int64) -> :less | :equal | :greater, compare_edge_data: fn(int64, int64) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, edge_weight: fn(int64) -> int64, compare_weight: fn(int64, int64) -> :less | :equal | :greater, compare_item: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, node_count: int64, edge_count: int64, adjacency_entry_count: int64, compare_node_ordering_token: int64, compare_edge_data_ordering_token: int64, edge_weight_ordering_token: int64, compare_weight_ordering_token: int64 } <- add_roads(new_graph(), 0);
+        _: atom <- println("shortest routes:");
+        _: atom <- show_route(shortest_paths(g, 0), 15);
+        _: atom <- show_route(shortest_paths(g, 6), 12);
+        _: atom <- show_route(shortest_paths(g, 2), 13);
+        _: atom <- show_route(shortest_paths(g, 4), 14);
+        _: atom <- show_route(shortest_paths(g, 0), 12);
+        _: atom <- show_tree(spanning_tree(g))
+    produces
+        pure :ok
+    end
+}
