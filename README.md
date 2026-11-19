@@ -23,8 +23,9 @@ Small, runnable programs written in [Silica](https://github.com/Silica-Language-
 | [`route-planner`](route-planner/) | Dijkstra shortest paths and Prim's minimum spanning tree over a European road network, using the standard library's weighted graph and Brodal–Okasaki priority queue |
 | [`sensor-telemetry`](sensor-telemetry/) | Timer-driven sensor actors send `wire_etf`-encoded readings over the `(:udp)` carrier to a collector that prints a live min/max/mean dashboard |
 | [`parallel-wordcount`](parallel-wordcount/) | Map-reduce word count: one mapper actor pinned to each CPU core, merged by a reducer into totals and a top-10 list |
+| [`glass-mine`](glass-mine/) | A choose-your-own-adventure played from the keyboard: standard input through the `(:serial) (:stdin)` carrier, put back into lines with `wireframe`'s `:lines` framing (needs a compiler with standard input; see its README) |
 
-The games play themselves: the language doesn't read from standard input yet, so there is no keyboard input. `dice-race` compiles with warning W2300, which says the referee's state is copied after every message. That's fine at this size.
+Most games play themselves. `glass-mine` is the one you play: it reads the keyboard through the new standard-input carrier, which is not in a released compiler yet. `dice-race` compiles with warning W2300, which says the referee's state is copied after every message. That's fine at this size.
 
 ## Install the CLI
 
