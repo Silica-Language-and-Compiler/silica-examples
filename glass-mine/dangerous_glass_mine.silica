@@ -1,0 +1,556 @@
+// The Glass Mine: a choose-your-own-adventure read from the keyboard.
+//
+//   $ silica run glass-mine
+//
+// Each scene ends with numbered choices; type a number and press Return. `look` shows the scene
+// again, `help` lists the commands, `quit` ends the game, and Ctrl-D (end of input) does too.
+//
+// Standard input is a link of the (:serial) carrier, `carried_on keyboard: (:serial) (:stdin);`. The
+// carrier is an actor: it answers `(:link_up, "stdin:tty")` (or "stdin:pipe" when the input is a file
+// or a pipe), then one `(:rx, chunk)` for every credit the game grants, and `(:link_down, :closed)` at
+// the end of input. A chunk is whatever one read(2) returned, so the game puts lines back together
+// with wireframe's :lines framing. It grants one credit at a time, after it has answered the chunk
+// it has, so nothing is read ahead of the story.
+//
+// The carrier is a dangerous actor (a Fifi carrier over a small C wrapper), so this is a dangerous_
+// module and the chunk is external-danger-touched: the (:rx) arm re-creates it with recreate(chunk,
+// { max_bytes: 65536 }) before any code reads it. utf8 validation is left to complete lines, because a
+// chunk can end in the middle of a UTF-8 sequence.
+module dangerous_glass_mine;
+
+use wireframe;
+use dangerous_console_stdin_carrier;
+
+carried_on keyboard: (:serial) (:stdin);
+
+// The longest line the game will read; a longer one is refused and skipped.
+fn max_line() -> int64 {
+    256
+}
+
+// The scene numbers. 1 to 6 are places, 91 to 95 the five endings.
+fn first_scene() -> int64 {
+    1
+}
+
+fn endings() -> int64 {
+    5
+}
+
+// ---- printing ------------------------------------------------------------------------------------
+
+fn say(s: string) -> atom {
+    sequence proc[device_io]
+        o: atom <- println(s)
+    produces
+        pure o
+    end
+}
+
+fn prompt() -> atom {
+    sequence proc[device_io]
+        o: atom <- print("> ")
+    produces
+        pure o
+    end
+}
+
+// With piped input nothing is typed on the screen, so the game shows the line it read.
+fn echo_line(echo: boolean, line: string) -> atom {
+    case echo of {
+        true -> say(line);
+        false -> :ok
+    }
+}
+
+fn say_stats(turns: int64, ending: int64) -> atom {
+    sequence proc[device_io]
+        _: atom <- print("You made ");
+        _: atom <- print_int64(turns);
+        _: atom <- print(case turns == 1 of { true -> " choice and found ending "; false -> " choices and found ending " });
+        _: atom <- print_int64(ending - 90);
+        _: atom <- print(" of ");
+        _: atom <- print_int64(endings());
+        o: atom <- println(".")
+    produces
+        pure o
+    end
+}
+
+// ---- talking to the carrier and ending the program ---------------------------------------------
+
+fn tell(car: dangerous_actor_ref, m: (:credit, int64) | :close) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast(car, m impl ActorMessage {})
+    produces
+        pure r
+    end
+}
+
+fn stop(code: int64) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast_exit(code)
+    produces
+        pure r
+    end
+}
+
+// ---- the story -----------------------------------------------------------------------------------
+
+fn scene_entrance() -> atom {
+    _: atom <- say("");
+    _: atom <- say("THE MOUTH OF THE MINE");
+    _: atom <- say("Wind whistles over the mouth of the old Halverd glass mine. Somewhere below, the");
+    _: atom <- say("miners used to say, lies the Heart: a crystal as big as a cart wheel. An oil");
+    _: atom <- say("lantern hangs on a nail by the entrance. Beside the main shaft, a narrow crack");
+    _: atom <- say("in the rock breathes cold air.");
+    _: atom <- say("  1) Take the lantern and climb down the main shaft");
+    _: atom <- say("  2) Leave the lantern and squeeze into the crack");
+    say("  3) Decide that treasure is overrated and walk home")
+}
+
+fn scene_shaft() -> atom {
+    _: atom <- say("");
+    _: atom <- say("THE MAIN SHAFT");
+    _: atom <- say("Your lantern throws long shadows down a ladder of rotten rungs. At the bottom the");
+    _: atom <- say("tunnel splits. From the left comes a soft hum, like a choir holding one note.");
+    _: atom <- say("From the right comes a cold draft and the sound of water.");
+    _: atom <- say("  1) Follow the humming");
+    say("  2) Follow the draft")
+}
+
+fn scene_crack() -> atom {
+    _: atom <- say("");
+    _: atom <- say("THE CRACK");
+    _: atom <- say("It is black as ink. You inch forward, scraping both shoulders, until the crack");
+    _: atom <- say("opens into somewhere bigger. Ahead you can hear water. Above you, something");
+    _: atom <- say("rustles.");
+    _: atom <- say("  1) Feel your way toward the water");
+    say("  2) Shout \"Hello?\"")
+}
+
+fn scene_gallery() -> atom {
+    _: atom <- say("");
+    _: atom <- say("THE SINGING GALLERY");
+    _: atom <- say("The walls are lined with quartz that hums wherever you touch it, each crystal a");
+    _: atom <- say("different note. Loose ones lie on the floor, still faintly ringing. A tunnel");
+    _: atom <- say("leads on, down and to the right.");
+    _: atom <- say("  1) Pocket a small singing crystal and go on");
+    say("  2) Leave the crystals be and go on")
+}
+
+fn scene_river(lantern: boolean) -> atom {
+    _: atom <- say("");
+    _: atom <- say("THE UNDERGROUND RIVER");
+    _: atom <- say("A black river slides past, fast and nearly silent.");
+    _: atom <- case lantern of {
+        true -> say("In the lantern light you can see flat stepping stones crossing it.");
+        false -> say("You can hear it, but you cannot see the other side.")
+    };
+    _: atom <- say("  1) Cross the river");
+    say("  2) Walk upstream, toward a faint humming")
+}
+
+fn scene_heart() -> atom {
+    _: atom <- say("");
+    _: atom <- say("THE HEART CHAMBER");
+    _: atom <- say("The tunnel ends in a round chamber. In its middle the Heart glows on a pillar of");
+    _: atom <- say("black stone, and in front of it stands a figure made of glass, taller than a door.");
+    _: atom <- say("Its blank face turns toward you, and it holds out one open hand.");
+    _: atom <- say("  1) Offer it something");
+    _: atom <- say("  2) Dash past it and grab the Heart");
+    say("  3) Back away slowly")
+}
+
+fn describe(scene: int64, lantern: boolean) -> atom {
+    case scene of {
+        1 -> scene_entrance();
+        2 -> scene_shaft();
+        3 -> scene_crack();
+        4 -> scene_gallery();
+        5 -> scene_river(lantern);
+        _: int64 -> scene_heart()
+    }
+}
+
+fn ending_title(ending: int64) -> string {
+    case ending of {
+        91 -> "The Long Walk Home";
+        92 -> "Wings in the Dark";
+        93 -> "Downstream";
+        94 -> "The Singing Shard";
+        _: int64 -> "The Heart of the Mountain"
+    }
+}
+
+fn ending_text(ending: int64) -> atom {
+    case ending of {
+        91 -> {
+            _: atom <- say("You climb back into the daylight with empty pockets and all ten fingers.");
+            say("Some days, that is the treasure.")
+        };
+        92 -> {
+            _: atom <- say("Your voice booms off the rock and a thousand bats burst from the ceiling. You run,");
+            _: atom <- say("blind, until you tumble out of a side passage onto the hillside: scratched,");
+            say("covered in bat droppings, and very much alive.")
+        };
+        93 -> {
+            _: atom <- say("One wrong step and the river has you. It is a cold, fast ride, and it spits you");
+            say("out into a pond at the foot of the mountain, gasping, alive and empty-handed.")
+        };
+        94 -> {
+            _: atom <- say("You hold out the singing crystal. The figure takes it, lifts it to where an ear");
+            _: atom <- say("would be, and hums back. Then it breaks a shard from the Heart and drops it, still");
+            say("warm, into your palm. The mine is very quiet as you leave, as if it is listening.")
+        };
+        _: int64 -> {
+            _: atom <- say("You duck under the glass hand, snatch the Heart and run. Behind you the figure");
+            _: atom <- say("starts to ring like a bell and the tunnels shake. You burst into the daylight as");
+            _: atom <- say("the entrance falls in behind you in a cloud of glittering dust. The Heart is heavy");
+            say("and beautiful, and the Halverd mine is gone for good.")
+        }
+    }
+}
+
+// Where a choice leads: a scene, an ending (91 to 95), 0 for a number that is not a choice here, or
+// a negative number for a choice that is there but cannot be made yet (see refusal).
+fn next_scene(scene: int64, n: int64, lantern: boolean, crystals: int64) -> int64 {
+    case scene of {
+        1 -> case n of { 1 -> 2; 2 -> 3; 3 -> 91; _: int64 -> 0 };
+        2 -> case n of { 1 -> 4; 2 -> 5; _: int64 -> 0 };
+        3 -> case n of { 1 -> 5; 2 -> 92; _: int64 -> 0 };
+        4 -> case n of { 1 -> 6; 2 -> 6; _: int64 -> 0 };
+        5 -> case n of {
+            1 -> case lantern of { true -> 6; false -> 93 };
+            2 -> 4;
+            _: int64 -> 0
+        };
+        _: int64 -> case n of {
+            1 -> case crystals > 0 of { true -> 94; false -> 0 - 1 };
+            2 -> case lantern of { true -> 95; false -> 0 - 2 };
+            3 -> 91;
+            _: int64 -> 0
+        }
+    }
+}
+
+fn refusal(code: int64) -> atom {
+    case code == 0 - 1 of {
+        true -> say("You pat your pockets. You have nothing to offer. The figure waits.");
+        false -> say("In the dark you cannot see a way past it. The figure waits.")
+    }
+}
+
+fn takes_lantern(scene: int64, n: int64) -> boolean {
+    scene == 1 and n == 1
+}
+
+fn takes_crystal(scene: int64, n: int64) -> boolean {
+    scene == 4 and n == 1
+}
+
+// ---- tidying a typed line ----------------------------------------------------------------------
+// byte_at and byte_slice are transport operations: they are called inside sequences that declare
+// `transport`, here, so the functions that use them stay plain.
+
+fn at(s: string, i: int64) -> int64 {
+    sequence proc[transport]
+        b: int64 <- byte_at(s, i)
+    produces
+        pure b
+    end
+}
+
+fn slice(s: string, start: int64, stop: int64) -> string {
+    sequence proc[mem(normal), transport]
+        out: string <- byte_slice(s, start, stop)
+    produces
+        pure out
+    end
+}
+
+fn is_blank(b: int64) -> boolean {
+    b == 32 or b == 9
+}
+
+fn first_solid(s: string, i: int64, n: int64) -> int64 {
+    case i >= n of {
+        true -> n;
+        false -> {
+            b: int64 <- at(s, i);
+            case is_blank(b) of { true -> first_solid(s, i + 1, n); false -> i }
+        }
+    }
+}
+
+fn solid_end(s: string, e: int64) -> int64 {
+    case e <= 0 of {
+        true -> 0;
+        false -> {
+            b: int64 <- at(s, e - 1);
+            case is_blank(b) of { true -> solid_end(s, e - 1); false -> e }
+        }
+    }
+}
+
+// The line without spaces or tabs at either end.
+fn trim(s: string) -> string {
+    n: int64 <- length_bytes(s);
+    start: int64 <- first_solid(s, 0, n);
+    stop: int64 <- solid_end(s, n);
+    case start >= stop of {
+        true -> "";
+        false -> slice(s, start, stop)
+    }
+}
+
+// ---- the game state ------------------------------------------------------------------------------
+// car: the stdin carrier; rx: the line framing; scene: where the player is; lantern and crystals:
+// what they carry; turns: choices made; echo: show each line read (piped input); done: the story ended.
+
+fn with_rx(st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, scene: int64, lantern: boolean, crystals: int64, turns: int64, echo: boolean, done: boolean }, rx: { mode: atom, expected: int64, pending: string }) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, scene: int64, lantern: boolean, crystals: int64, turns: int64, echo: boolean, done: boolean } {
+    { car: st.car, rx: rx, scene: st.scene, lantern: st.lantern, crystals: st.crystals, turns: st.turns, echo: st.echo, done: st.done }
+}
+
+fn with_echo(st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, scene: int64, lantern: boolean, crystals: int64, turns: int64, echo: boolean, done: boolean }, echo: boolean) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, scene: int64, lantern: boolean, crystals: int64, turns: int64, echo: boolean, done: boolean } {
+    { car: st.car, rx: st.rx, scene: st.scene, lantern: st.lantern, crystals: st.crystals, turns: st.turns, echo: echo, done: st.done }
+}
+
+fn finished(st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, scene: int64, lantern: boolean, crystals: int64, turns: int64, echo: boolean, done: boolean }) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, scene: int64, lantern: boolean, crystals: int64, turns: int64, echo: boolean, done: boolean } {
+    _: boolean <- tell(st.car, :close);
+    { car: st.car, rx: st.rx, scene: st.scene, lantern: st.lantern, crystals: st.crystals, turns: st.turns, echo: st.echo, done: true }
+}
+
+// Arriving somewhere: an ending closes the keyboard, a scene is described and asks again.
+fn arrive(target: int64, lantern: boolean, crystals: int64, st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, scene: int64, lantern: boolean, crystals: int64, turns: int64, echo: boolean, done: boolean }) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, scene: int64, lantern: boolean, crystals: int64, turns: int64, echo: boolean, done: boolean } {
+    turns: int64 <- st.turns + 1;
+    moved: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, scene: int64, lantern: boolean, crystals: int64, turns: int64, echo: boolean, done: boolean } <- { car: st.car, rx: st.rx, scene: target, lantern: lantern, crystals: crystals, turns: turns, echo: st.echo, done: false };
+    case target > 90 of {
+        true -> {
+            title: string <- ending_title(target);
+            _: atom <- say("");
+            _: atom <- ending_text(target);
+            _: atom <- say("");
+            _: atom <- say(concat(concat("*** THE END: ", title), " ***"));
+            _: atom <- say_stats(turns, target);
+            finished(moved)
+        };
+        false -> {
+            _: atom <- describe(target, lantern);
+            _: atom <- prompt();
+            moved
+        }
+    }
+}
+
+fn choose(n: int64, st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, scene: int64, lantern: boolean, crystals: int64, turns: int64, echo: boolean, done: boolean }) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, scene: int64, lantern: boolean, crystals: int64, turns: int64, echo: boolean, done: boolean } {
+    target: int64 <- next_scene(st.scene, n, st.lantern, st.crystals);
+    case target == 0 of {
+        true -> {
+            _: atom <- say("That is not one of the choices here.");
+            _: atom <- prompt();
+            st
+        };
+        false -> case target < 0 of {
+            true -> {
+                _: atom <- refusal(target);
+                _: atom <- prompt();
+                st
+            };
+            false -> {
+                lantern: boolean <- st.lantern or takes_lantern(st.scene, n);
+                crystals: int64 <- case takes_crystal(st.scene, n) of { true -> st.crystals + 1; false -> st.crystals };
+                arrive(target, lantern, crystals, st)
+            }
+        }
+    }
+}
+
+fn help() -> atom {
+    _: atom <- say("Type the number of a choice and press Return.");
+    _: atom <- say("  look   show the scene again");
+    _: atom <- say("  help   show this list");
+    say("  quit   stop playing (Ctrl-D works too)")
+}
+
+// One line the player typed.
+fn command(line: string, st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, scene: int64, lantern: boolean, crystals: int64, turns: int64, echo: boolean, done: boolean }) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, scene: int64, lantern: boolean, crystals: int64, turns: int64, echo: boolean, done: boolean } {
+    case line == "1" or line == "2" or line == "3" of {
+        true -> case line == "1" of {
+            true -> choose(1, st);
+            false -> case line == "2" of { true -> choose(2, st); false -> choose(3, st) }
+        };
+        false -> case line == "look" or line == "l" of {
+            true -> {
+                _: atom <- describe(st.scene, st.lantern);
+                _: atom <- prompt();
+                st
+            };
+            false -> case line == "quit" or line == "q" of {
+                true -> {
+                    _: atom <- say("You set down your pack. The mine will wait for you.");
+                    finished(st)
+                };
+                false -> case line == "help" or line == "?" of {
+                    true -> {
+                        _: atom <- help();
+                        _: atom <- prompt();
+                        st
+                    };
+                    false -> case line == "" of {
+                        true -> {
+                            _: atom <- prompt();
+                            st
+                        };
+                        false -> {
+                            _: atom <- say("Type the number of a choice, or look, help or quit.");
+                            _: atom <- prompt();
+                            st
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn on_line(line: string, st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, scene: int64, lantern: boolean, crystals: int64, turns: int64, echo: boolean, done: boolean }) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, scene: int64, lantern: boolean, crystals: int64, turns: int64, echo: boolean, done: boolean } {
+    case st.done of {
+        true -> st;
+        false -> {
+            _: atom <- echo_line(st.echo, line);
+            typed: string <- trim(line);
+            command(typed, st)
+        }
+    }
+}
+
+// ---- reading lines -------------------------------------------------------------------------------
+// One chunk can hold several lines: answer each, then ask the framing again with "" until only part
+// of a line is left. seg is the chunk the call that produced r was given ("" when draining) and
+// st.rx the framing state it was given, so a line that is too long is skipped through its newline
+// (wireframe@skip_line) and whatever follows it is kept.
+
+fn drain(r: (:more, { mode: atom, expected: int64, pending: string }) | (:frame, string, { mode: atom, expected: int64, pending: string }) | (:rejected, atom), seg: string, st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, scene: int64, lantern: boolean, crystals: int64, turns: int64, echo: boolean, done: boolean }) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, scene: int64, lantern: boolean, crystals: int64, turns: int64, echo: boolean, done: boolean } {
+    case r of {
+        (:more, rx1: { mode: atom, expected: int64, pending: string }) -> with_rx(st, rx1);
+        (:frame, line: string, rx2: { mode: atom, expected: int64, pending: string }) -> {
+            framed: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, scene: int64, lantern: boolean, crystals: int64, turns: int64, echo: boolean, done: boolean } <- with_rx(st, rx2);
+            st2: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, scene: int64, lantern: boolean, crystals: int64, turns: int64, echo: boolean, done: boolean } <- on_line(line, framed);
+            next: (:more, { mode: atom, expected: int64, pending: string }) | (:frame, string, { mode: atom, expected: int64, pending: string }) | (:rejected, atom) <- wireframe@unframe(st2.rx, "", max_line());
+            drain(next, "", st2)
+        };
+        (:rejected, _why: atom) -> {
+            _: atom <- say("(That line is too long; the mine ignores it.)");
+            _: atom <- prompt();
+            skipped: { mode: atom, expected: int64, pending: string } <- wireframe@skip_line(st.rx, seg);
+            next: (:more, { mode: atom, expected: int64, pending: string }) | (:frame, string, { mode: atom, expected: int64, pending: string }) | (:rejected, atom) <- wireframe@unframe(skipped, "", max_line());
+            drain(next, "", st)
+        }
+    }
+}
+
+fn on_rx(segment: string, st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, scene: int64, lantern: boolean, crystals: int64, turns: int64, echo: boolean, done: boolean }) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, scene: int64, lantern: boolean, crystals: int64, turns: int64, echo: boolean, done: boolean } {
+    first: (:more, { mode: atom, expected: int64, pending: string }) | (:frame, string, { mode: atom, expected: int64, pending: string }) | (:rejected, atom) <- wireframe@unframe(st.rx, segment, max_line());
+    after: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, scene: int64, lantern: boolean, crystals: int64, turns: int64, echo: boolean, done: boolean } <- drain(first, segment, st);
+    // One more chunk, only once this one is answered and only while the story goes on.
+    _: boolean <- case after.done of {
+        true -> true;
+        false -> tell(after.car, (:credit, 1))
+    };
+    after
+}
+
+// A chunk that recreate refused (more than 65536 bytes): say so, show the prompt and ask again.
+fn say_refused(why: atom) -> atom {
+    sequence proc[device_io]
+        _: atom <- print("That input could not be read: ");
+        _: atom <- print_atom(why);
+        o: atom <- println("")
+    produces
+        pure o
+    end
+}
+
+fn on_refused(why: atom, st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, scene: int64, lantern: boolean, crystals: int64, turns: int64, echo: boolean, done: boolean }) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, scene: int64, lantern: boolean, crystals: int64, turns: int64, echo: boolean, done: boolean } {
+    _: atom <- say_refused(why);
+    _: atom <- prompt();
+    _: boolean <- tell(st.car, (:credit, 1));
+    st
+}
+
+// The pure bytes of a chunk are framed and answered as before; a refused chunk is not.
+fn on_recreated(r: (:ok, string) | (:rejected, atom), st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, scene: int64, lantern: boolean, crystals: int64, turns: int64, echo: boolean, done: boolean }) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, scene: int64, lantern: boolean, crystals: int64, turns: int64, echo: boolean, done: boolean } {
+    case r of {
+        (:ok, data: string) -> on_rx(data, st);
+        (:rejected, why: atom) -> on_refused(why, st)
+    }
+}
+
+fn on_link_up(info: string, st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, scene: int64, lantern: boolean, crystals: int64, turns: int64, echo: boolean, done: boolean }) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, scene: int64, lantern: boolean, crystals: int64, turns: int64, echo: boolean, done: boolean } {
+    piped: boolean <- info != "stdin:tty";
+    _: atom <- say("THE GLASS MINE");
+    _: atom <- say("A choose-your-own-adventure. Type a number to choose, or help.");
+    _: atom <- describe(first_scene(), false);
+    _: atom <- prompt();
+    _: boolean <- tell(st.car, (:credit, 1));
+    with_echo(st, piped)
+}
+
+// The keyboard is closed: by an ending or quit (done), or by the end of input mid-story.
+fn on_link_down(st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, scene: int64, lantern: boolean, crystals: int64, turns: int64, echo: boolean, done: boolean }) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, scene: int64, lantern: boolean, crystals: int64, turns: int64, echo: boolean, done: boolean } {
+    _: atom <- case st.done of {
+        true -> :ok;
+        false -> {
+            _: atom <- say("");
+            say("The lantern gutters out and the story fades. Come back another day.")
+        }
+    };
+    _: boolean <- stop(0);
+    st
+}
+
+fn game(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom), state: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, scene: int64, lantern: boolean, crystals: int64, turns: int64, echo: boolean, done: boolean }) -> (:no_reply, { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, scene: int64, lantern: boolean, crystals: int64, turns: int64, echo: boolean, done: boolean }) {
+    case msg of {
+        (:link_up, info: string) -> (:no_reply, on_link_up(info, state));
+        (:rx, chunk: string) -> {
+            // The chunk is external-danger-touched: re-create it (the de-taint) before anything reads it.
+            sequence proc[transport]
+                r: (:ok, string) | (:rejected, atom) <- recreate(chunk, { max_bytes: 65536 });
+                st2: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, scene: int64, lantern: boolean, crystals: int64, turns: int64, echo: boolean, done: boolean } <- on_recreated(r, state)
+            produces
+                pure (:no_reply, st2)
+            end
+        };
+        (:tx_credit, _n: int64) -> (:no_reply, state);
+        (:tx_failed, _why: atom) -> (:no_reply, state);
+        (:link_down, _why: atom) -> (:no_reply, on_link_down(state))
+    }
+}
+
+// ---- start-up ------------------------------------------------------------------------------------
+
+// How many memory regions to dump when an actor fails (none). The runtime links against this.
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// Every program that spawns actors registers a failure reporter first (spec §15.4.13.4).
+fn reporter(_report: string, count: int64) -> (:no_reply, int64) {
+    (:no_reply, count + 1)
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        rep: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: atom <- register_failure_reporter(rep);
+        car: dangerous_actor_ref <- spawn_dangerous_carrier(keyboard, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        rx0: { mode: atom, expected: int64, pending: string } <- wireframe@fresh(:lines);
+        start: int64 <- first_scene();
+        player: actor_ref <- spawn({ car: car, rx: rx0, scene: start, lantern: false, crystals: 0, turns: 0, echo: false, done: false }, game, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: boolean <- cast(car, (:open, player, "") impl ActorMessage {});
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}
