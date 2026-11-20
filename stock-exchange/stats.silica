@@ -1,0 +1,80 @@
+// Market statistics over the trade tape: open, high, low, close, volume, turnover and VWAP.
+//
+// Each statistic is one fold over the list of trades with a different function literal, so the
+// recursion is written once. Turnover goes through the Priced trait, the same notional the risk desk
+// uses.
+
+use Priced;
+
+export fold/3;
+export count/1;
+export high/1;
+export low/1;
+export volume/1;
+export turnover/1;
+export vwap/1;
+export first_px/2;
+export blocks/1;
+
+fn fold(xs: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)], acc: int64, f: fn(a: int64, t: { buyer: int64, seller: int64, px: int64, qty: int64 }) -> int64) -> int64 {
+    case xs of {
+        []: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)] -> acc;
+        [h: { buyer: int64, seller: int64, px: int64, qty: int64 }, t: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)]] -> fold(t, f(acc, h), f)
+    }
+}
+
+fn count(xs: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)]) -> int64 {
+    fold(xs, 0, fn(a: int64, _t: { buyer: int64, seller: int64, px: int64, qty: int64 }) -> int64 { a + 1 })
+}
+
+fn high(xs: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)]) -> int64 {
+    fold(xs, 0, fn(a: int64, t: { buyer: int64, seller: int64, px: int64, qty: int64 }) -> int64 {
+        case t.px > a of {
+            true -> t.px;
+            false -> a
+        }
+    })
+}
+
+fn low(xs: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)]) -> int64 {
+    fold(xs, 99999, fn(a: int64, t: { buyer: int64, seller: int64, px: int64, qty: int64 }) -> int64 {
+        case t.px < a of {
+            true -> t.px;
+            false -> a
+        }
+    })
+}
+
+fn volume(xs: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)]) -> int64 {
+    fold(xs, 0, fn(a: int64, t: { buyer: int64, seller: int64, px: int64, qty: int64 }) -> int64 { a + t.qty })
+}
+
+fn turnover(xs: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)]) -> int64 {
+    fold(xs, 0, fn(a: int64, t: { buyer: int64, seller: int64, px: int64, qty: int64 }) -> int64 { a + Priced@notional(t) })
+}
+
+fn blocks(xs: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)]) -> int64 {
+    fold(xs, 0, fn(a: int64, t: { buyer: int64, seller: int64, px: int64, qty: int64 }) -> int64 {
+        case Priced@is_block(t) of {
+            true -> a + 1;
+            false -> a
+        }
+    })
+}
+
+// Volume-weighted average price in cents, rounded to the nearest cent; 0 with no trades.
+fn vwap(xs: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)]) -> int64 {
+    v: int64 <- volume(xs);
+    case v == 0 of {
+        true -> 0;
+        false -> (turnover(xs) + v / 2) / v
+    }
+}
+
+// The price of the first trade in the list, or the fallback for an empty list.
+fn first_px(xs: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)], fallback: int64) -> int64 {
+    case xs of {
+        []: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)] -> fallback;
+        [h: { buyer: int64, seller: int64, px: int64, qty: int64 }, _t: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)]] -> h.px
+    }
+}

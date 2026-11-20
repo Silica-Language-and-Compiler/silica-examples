@@ -1,0 +1,30 @@
+// The Priced trait: anything with a price and a quantity has a notional value (price times shares,
+// in cents). Order tickets and trades both implement it, so the risk desk's notional limit and the
+// tape's turnover, VWAP and block-trade flag are one piece of code.
+
+export trait Priced;
+export notional/1;
+export is_block/1;
+
+required {
+    fn notional(p: Priced) -> int64;
+}
+
+provided {
+    // A block trade is worth $40,000 or more.
+    fn is_block(p: Priced) -> boolean {
+        Priced@notional(p) >= 4000000
+    }
+}
+
+impl fn notional(t: { kind: :limit | :market | :cancel, side: :buy | :sell, trader: int64, px: int64, qty: int64, reference: int64 }) -> int64 {
+    case t.kind of {
+        :limit -> t.px * t.qty;
+        :market -> t.reference * t.qty;
+        :cancel -> 0
+    }
+}
+
+impl fn notional(t: { buyer: int64, seller: int64, px: int64, qty: int64 }) -> int64 {
+    t.px * t.qty
+}

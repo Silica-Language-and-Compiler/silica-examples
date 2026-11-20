@@ -1,0 +1,815 @@
+// A stock exchange: four trading strategies, a supervised risk desk, a price-time priority matching
+// engine, a live trade tape and a clearing ledger, each one an actor.
+//
+//   driver ──call──▶ engine          (:quote: what does the book look like?)
+//   driver ──call──▶ trader k        (the snapshot; the trader answers with its next order)
+//   driver ──cast──▶ risk worker     (the order, packed into one int64 ticket by `codec`)
+//   risk worker ──call──▶ engine     (an order that passed the checks; the engine matches it)
+//   engine ──cast──▶ tape ──cast──▶ ledger   (every trade, in the order it happened)
+//   risk worker / supervisor sink ──cast──▶ driver   (the order's outcome; then the next one)
+//
+// Exactly one order is in flight at a time, so a run is deterministic: the same orders, trades and
+// positions every time. The traders' randomness comes from seeded generators (`rng`).
+//
+// The risk desk is a Supervisor with two workers. It refuses limit orders priced more than 5% from
+// the last trade, and it has a deliberate bug: it divides by the number of round lots (100 shares)
+// in an order, so an odd lot of 50 shares divides by zero and crashes the worker. The supervisor
+// restarts it (:permanent, :one_for_one), the FailureReporter prints the crash report to standard
+// error, and the session carries on. Let it crash.
+//
+// The engine runs a circuit breaker: a trade more than 0.40% from the reference price halts the
+// market, the book freezes for six orders, and a call auction reopens it at the single price that
+// trades the most shares. Traders never trade with themselves (self-trade prevention).
+//
+// Modules:
+//   book       the order book and the matching algorithm (pure)
+//   Strategy   trait: market maker, momentum and noise traders are three record shapes
+//   Priced     trait: notional value of order tickets and trades
+//   codec      packs an order ticket into one int64 for the risk workers
+//   stats      OHLC, volume, turnover and VWAP as folds with function literals
+//   ledger     positions and cash, and the zero-sum invariant
+//   market     tick size, mid price, price bands
+//   rng        a deterministic linear congruential generator
+//   fmt        prices, money and aligned columns
+//
+//   silica run stock-exchange
+
+use Supervisor;
+use Strategy;
+use Priced;
+use book;
+use codec;
+use stats;
+use ledger;
+use market;
+use rng;
+use fmt;
+
+impl RiskDesk for Supervisor;
+
+// ---------------------------------------------------------------------------------------------
+// Session parameters.
+
+fn rounds() -> int64 {
+    240
+}
+
+fn trader_count() -> int64 {
+    4
+}
+
+fn opening_price() -> int64 {
+    10000
+}
+
+// The registered name of trader k.
+fn trader_atom(k: int64) -> atom {
+    case k of {
+        0 -> :maker_tight;
+        1 -> :maker_wide;
+        2 -> :momentum;
+        _: int64 -> :noise
+    }
+}
+
+// Orders alternate between the two risk workers.
+fn risk_worker_name(n: int64) -> atom {
+    case n % 2 of {
+        0 -> :risk_a;
+        _: int64 -> :risk_b
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The engine: the only owner of the book. A call-only actor: every request gets a status reply.
+//
+// The engine is also a two-state machine with a circuit breaker. In :continuous trading every order
+// is matched as it arrives. A trade more than 0.40% away from the reference price (the opening
+// price, later the last auction price) halts the market. In :halted, orders rest without matching
+// (a market order joins at the edge of the band, the worst price it may get) and after six orders a
+// reopening call auction uncrosses the book at one price; continuous trading resumes from there.
+
+fn halt_orders() -> int64 {
+    6
+}
+
+// The breaker's band, in basis points (hundredths of a percent) of the reference price.
+fn halt_bp() -> int64 {
+    40
+}
+
+fn status(st: { bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], next_id: int64, last: int64, prev: int64, stp: int64, phase: :continuous | :halted, halt_left: int64, reference: int64, halts: int64 }, fills: int64, filled: int64, rested: int64) -> { bid: int64, ask: int64, last: int64, prev: int64, fills: int64, filled: int64, rested: int64, bids: int64, asks: int64, stp: int64, halts: int64 } {
+    {
+        bid: book@best(st.bids, 0),
+        ask: book@best(st.asks, 0),
+        last: st.last,
+        prev: st.prev,
+        fills: fills,
+        filled: filled,
+        rested: rested,
+        bids: book@depth(st.bids),
+        asks: book@depth(st.asks),
+        stp: st.stp,
+        halts: st.halts
+    }
+}
+
+fn to_tape(m: (:trade, int64, int64, int64, int64) | (:note, int64, int64, int64) | (:banner, int64, int64, int64) | (:level, int64, int64, int64, int64) | (:close, int64, int64, int64, int64, int64, int64, int64)) -> boolean {
+    sequence proc[concurrency]
+        sent: boolean <- cast_registered(:tape, m impl ActorMessage {})
+    produces
+        pure sent
+    end
+}
+
+// Casts every trade to the tape, oldest first.
+fn publish(trades: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)]) -> boolean {
+    case trades of {
+        []: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)] -> true;
+        [t: { buyer: int64, seller: int64, px: int64, qty: int64 }, rest: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)]] -> {
+            _: boolean <- to_tape((:trade, t.buyer, t.seller, t.px, t.qty));
+            publish(rest)
+        }
+    }
+}
+
+// The price limit a market order sweeps to: everything on the other side.
+fn sweep_limit(side: :buy | :sell) -> int64 {
+    case side of {
+        :buy -> 99999;
+        :sell -> 0
+    }
+}
+
+// The same engine state with a new book.
+fn with_book(st: { bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], next_id: int64, last: int64, prev: int64, stp: int64, phase: :continuous | :halted, halt_left: int64, reference: int64, halts: int64 }, bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)]) -> { bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], next_id: int64, last: int64, prev: int64, stp: int64, phase: :continuous | :halted, halt_left: int64, reference: int64, halts: int64 } {
+    { bids: bids, asks: asks, next_id: st.next_id, last: st.last, prev: st.prev, stp: st.stp, phase: st.phase, halt_left: st.halt_left, reference: st.reference, halts: st.halts }
+}
+
+// Trips the breaker when the last trade left the band; otherwise the state is unchanged.
+fn breaker(st: { bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], next_id: int64, last: int64, prev: int64, stp: int64, phase: :continuous | :halted, halt_left: int64, reference: int64, halts: int64 }, fills: int64) -> { bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], next_id: int64, last: int64, prev: int64, stp: int64, phase: :continuous | :halted, halt_left: int64, reference: int64, halts: int64 } {
+    case fills > 0 and not market@within_bp(st.last, st.reference, halt_bp()) of {
+        false -> st;
+        true -> {
+            _: boolean <- to_tape((:banner, 2, st.last, st.reference));
+            { bids: st.bids, asks: st.asks, next_id: st.next_id, last: st.last, prev: st.prev, stp: st.stp, phase: :halted, halt_left: halt_orders(), reference: st.reference, halts: st.halts + 1 }
+        }
+    }
+}
+
+// Continuous trading: matches a limit (rests = true) or market (rests = false) order.
+fn execute(msg: { op: :quote | :limit | :market | :cancel | :close, side: :buy | :sell, trader: int64, px: int64, qty: int64 }, st: { bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], next_id: int64, last: int64, prev: int64, stp: int64, phase: :continuous | :halted, halt_left: int64, reference: int64, halts: int64 }, rests: boolean) -> (:reply, { bid: int64, ask: int64, last: int64, prev: int64, fills: int64, filled: int64, rested: int64, bids: int64, asks: int64, stp: int64, halts: int64 }, { bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], next_id: int64, last: int64, prev: int64, stp: int64, phase: :continuous | :halted, halt_left: int64, reference: int64, halts: int64 }) {
+    limit: int64 <- case rests of {
+        true -> msg.px;
+        false -> sweep_limit(msg.side)
+    };
+    order: { id: int64, trader: int64, px: int64, qty: int64 } <- { id: st.next_id, trader: msg.trader, px: limit, qty: msg.qty };
+    r: { own: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], opp: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], trades: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)], rested: int64, stp: int64 } <- case msg.side of {
+        :buy -> book@match_order(st.bids, st.asks, msg.side, order, rests);
+        :sell -> book@match_order(st.asks, st.bids, msg.side, order, rests)
+    };
+    _: boolean <- publish(r.trades);
+    fills: int64 <- stats@count(r.trades);
+    last: int64 <- stats@fold(r.trades, st.last, fn(_a: int64, t: { buyer: int64, seller: int64, px: int64, qty: int64 }) -> int64 { t.px });
+    prev: int64 <- case fills == 0 of {
+        true -> st.prev;
+        false -> st.last
+    };
+    bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)] <- case msg.side of {
+        :buy -> r.own;
+        :sell -> r.opp
+    };
+    asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)] <- case msg.side of {
+        :buy -> r.opp;
+        :sell -> r.own
+    };
+    next: { bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], next_id: int64, last: int64, prev: int64, stp: int64, phase: :continuous | :halted, halt_left: int64, reference: int64, halts: int64 } <- breaker({ bids: bids, asks: asks, next_id: st.next_id + 1, last: last, prev: prev, stp: st.stp + r.stp, phase: st.phase, halt_left: st.halt_left, reference: st.reference, halts: st.halts }, fills);
+    (:reply, status(next, fills, stats@volume(r.trades), r.rested), next)
+}
+
+// Pulls the trader's oldest quote from one side of the book.
+fn withdraw(msg: { op: :quote | :limit | :market | :cancel | :close, side: :buy | :sell, trader: int64, px: int64, qty: int64 }, st: { bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], next_id: int64, last: int64, prev: int64, stp: int64, phase: :continuous | :halted, halt_left: int64, reference: int64, halts: int64 }) -> { bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], next_id: int64, last: int64, prev: int64, stp: int64, phase: :continuous | :halted, halt_left: int64, reference: int64, halts: int64 } {
+    case msg.side of {
+        :buy -> {
+            (bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], _found_bid: boolean) <- book@cancel(st.bids, msg.trader);
+            with_book(st, bids, st.asks)
+        };
+        :sell -> {
+            (asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], _found_ask: boolean) <- book@cancel(st.asks, msg.trader);
+            with_book(st, st.bids, asks)
+        }
+    }
+}
+
+// The reopening auction, then continuous trading from the auction price. Ties between auction
+// prices go to the one closest to the last trade, which is also the new reference when nothing can
+// trade at all.
+fn reopen(st: { bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], next_id: int64, last: int64, prev: int64, stp: int64, phase: :continuous | :halted, halt_left: int64, reference: int64, halts: int64 }) -> { bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], next_id: int64, last: int64, prev: int64, stp: int64, phase: :continuous | :halted, halt_left: int64, reference: int64, halts: int64 } {
+    a: { bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], trades: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)], px: int64 } <- book@auction(st.bids, st.asks, st.last);
+    _: boolean <- to_tape((:banner, 3, a.px, stats@volume(a.trades)));
+    _: boolean <- publish(a.trades);
+    { bids: a.bids, asks: a.asks, next_id: st.next_id, last: a.px, prev: st.last, stp: st.stp, phase: :continuous, halt_left: 0, reference: a.px, halts: st.halts }
+}
+
+// One more order has arrived during the halt; the last one reopens the market.
+fn count_down(st: { bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], next_id: int64, last: int64, prev: int64, stp: int64, phase: :continuous | :halted, halt_left: int64, reference: int64, halts: int64 }) -> { bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], next_id: int64, last: int64, prev: int64, stp: int64, phase: :continuous | :halted, halt_left: int64, reference: int64, halts: int64 } {
+    case st.halt_left <= 1 of {
+        true -> reopen(st);
+        false -> { bids: st.bids, asks: st.asks, next_id: st.next_id, last: st.last, prev: st.prev, stp: st.stp, phase: st.phase, halt_left: st.halt_left - 1, reference: st.reference, halts: st.halts }
+    }
+}
+
+// The price a market order joins the auction at: the edge of the band around the last trade.
+fn band_edge(side: :buy | :sell, last: int64) -> int64 {
+    reach: int64 <- last * halt_bp() / 10000;
+    case side of {
+        :buy -> market@on_tick(last + reach);
+        :sell -> market@on_tick(last - reach + market@tick())
+    }
+}
+
+// During a halt an order joins the book unmatched.
+fn hold(msg: { op: :quote | :limit | :market | :cancel | :close, side: :buy | :sell, trader: int64, px: int64, qty: int64 }, st: { bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], next_id: int64, last: int64, prev: int64, stp: int64, phase: :continuous | :halted, halt_left: int64, reference: int64, halts: int64 }) -> { bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], next_id: int64, last: int64, prev: int64, stp: int64, phase: :continuous | :halted, halt_left: int64, reference: int64, halts: int64 } {
+    px: int64 <- case msg.op of {
+        :market -> band_edge(msg.side, st.last);
+        _: atom -> msg.px
+    };
+    order: { id: int64, trader: int64, px: int64, qty: int64 } <- { id: st.next_id, trader: msg.trader, px: px, qty: msg.qty };
+    counted: { bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], next_id: int64, last: int64, prev: int64, stp: int64, phase: :continuous | :halted, halt_left: int64, reference: int64, halts: int64 } <- { bids: st.bids, asks: st.asks, next_id: st.next_id + 1, last: st.last, prev: st.prev, stp: st.stp, phase: st.phase, halt_left: st.halt_left, reference: st.reference, halts: st.halts };
+    case msg.side of {
+        :buy -> with_book(counted, book@rest_order(st.bids, msg.side, order), st.asks);
+        :sell -> with_book(counted, st.bids, book@rest_order(st.asks, msg.side, order))
+    }
+}
+
+fn halted(msg: { op: :quote | :limit | :market | :cancel | :close, side: :buy | :sell, trader: int64, px: int64, qty: int64 }, st: { bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], next_id: int64, last: int64, prev: int64, stp: int64, phase: :continuous | :halted, halt_left: int64, reference: int64, halts: int64 }) -> (:reply, { bid: int64, ask: int64, last: int64, prev: int64, fills: int64, filled: int64, rested: int64, bids: int64, asks: int64, stp: int64, halts: int64 }, { bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], next_id: int64, last: int64, prev: int64, stp: int64, phase: :continuous | :halted, halt_left: int64, reference: int64, halts: int64 }) {
+    next: { bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], next_id: int64, last: int64, prev: int64, stp: int64, phase: :continuous | :halted, halt_left: int64, reference: int64, halts: int64 } <- count_down(case msg.op of {
+        :cancel -> withdraw(msg, st);
+        _: atom -> hold(msg, st)
+    });
+    (:reply, status(next, 0, 0, 0), next)
+}
+
+fn continuous(msg: { op: :quote | :limit | :market | :cancel | :close, side: :buy | :sell, trader: int64, px: int64, qty: int64 }, st: { bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], next_id: int64, last: int64, prev: int64, stp: int64, phase: :continuous | :halted, halt_left: int64, reference: int64, halts: int64 }) -> (:reply, { bid: int64, ask: int64, last: int64, prev: int64, fills: int64, filled: int64, rested: int64, bids: int64, asks: int64, stp: int64, halts: int64 }, { bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], next_id: int64, last: int64, prev: int64, stp: int64, phase: :continuous | :halted, halt_left: int64, reference: int64, halts: int64 }) {
+    case msg.op of {
+        :limit -> execute(msg, st, true);
+        :market -> execute(msg, st, false);
+        _: atom -> {
+            next: { bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], next_id: int64, last: int64, prev: int64, stp: int64, phase: :continuous | :halted, halt_left: int64, reference: int64, halts: int64 } <- withdraw(msg, st);
+            (:reply, status(next, 0, 0, 0), next)
+        }
+    }
+}
+
+// How many price levels of each side the closing book shows.
+fn ladder_depth() -> int64 {
+    5
+}
+
+// Casts one (:level, side, px, qty, orders) message per level. side is 1 for asks and 0 for bids.
+fn publish_levels(xs: List[{ px: int64, qty: int64, orders: int64 }, mem(normal)], side: int64) -> boolean {
+    case xs of {
+        []: List[{ px: int64, qty: int64, orders: int64 }, mem(normal)] -> true;
+        [l: { px: int64, qty: int64, orders: int64 }, rest: List[{ px: int64, qty: int64, orders: int64 }, mem(normal)]] -> {
+            _: boolean <- to_tape((:level, side, l.px, l.qty, l.orders));
+            publish_levels(rest, side)
+        }
+    }
+}
+
+fn reverse_levels(xs: List[{ px: int64, qty: int64, orders: int64 }, mem(normal)], acc: List[{ px: int64, qty: int64, orders: int64 }, mem(normal)]) -> List[{ px: int64, qty: int64, orders: int64 }, mem(normal)] {
+    case xs of {
+        []: List[{ px: int64, qty: int64, orders: int64 }, mem(normal)] -> acc;
+        [h: { px: int64, qty: int64, orders: int64 }, t: List[{ px: int64, qty: int64, orders: int64 }, mem(normal)]] -> {
+            sequence proc[mem(normal)]
+                next: List[{ px: int64, qty: int64, orders: int64 }, mem(normal)] <- prepend[{ px: int64, qty: int64, orders: int64 }, mem(normal)](h, acc)
+            produces
+                pure reverse_levels(t, next)
+            end
+        }
+    }
+}
+
+fn no_levels() -> List[{ px: int64, qty: int64, orders: int64 }, mem(normal)] {
+    sequence proc[mem(normal)]
+        out: List[{ px: int64, qty: int64, orders: int64 }, mem(normal)] <- empty[{ px: int64, qty: int64, orders: int64 }, mem(normal)]()
+    produces
+        pure out
+    end
+}
+
+// The closing book as a ladder: the asks from the highest shown down to the best, the spread, then
+// the bids from the best down.
+fn publish_ladder(st: { bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], next_id: int64, last: int64, prev: int64, stp: int64, phase: :continuous | :halted, halt_left: int64, reference: int64, halts: int64 }) -> boolean {
+    _: boolean <- to_tape((:banner, 0, ladder_depth(), 0));
+    _: boolean <- publish_levels(reverse_levels(book@levels(st.asks, ladder_depth()), no_levels()), 1);
+    _: boolean <- to_tape((:banner, 1, book@best(st.bids, 0), book@best(st.asks, 0)));
+    publish_levels(book@levels(st.bids, ladder_depth()), 0)
+}
+
+fn engine(msg: { op: :quote | :limit | :market | :cancel | :close, side: :buy | :sell, trader: int64, px: int64, qty: int64 }, st: { bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], next_id: int64, last: int64, prev: int64, stp: int64, phase: :continuous | :halted, halt_left: int64, reference: int64, halts: int64 }) -> (:reply, { bid: int64, ask: int64, last: int64, prev: int64, fills: int64, filled: int64, rested: int64, bids: int64, asks: int64, stp: int64, halts: int64 }, { bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], next_id: int64, last: int64, prev: int64, stp: int64, phase: :continuous | :halted, halt_left: int64, reference: int64, halts: int64 }) {
+    case msg.op of {
+        :quote -> (:reply, status(st, 0, 0, 0), st);
+        :close -> {
+            _: boolean <- publish_ladder(st);
+            (:reply, status(st, 0, 0, 0), st)
+        };
+        _: atom -> case st.phase of {
+            :continuous -> continuous(msg, st);
+            :halted -> halted(msg, st)
+        }
+    }
+}
+
+fn engine_request(op: :quote | :limit | :market | :cancel | :close, side: :buy | :sell, trader: int64, px: int64, qty: int64) -> { bid: int64, ask: int64, last: int64, prev: int64, fills: int64, filled: int64, rested: int64, bids: int64, asks: int64, stp: int64, halts: int64 } {
+    sequence proc[concurrency]
+        s: { bid: int64, ask: int64, last: int64, prev: int64, fills: int64, filled: int64, rested: int64, bids: int64, asks: int64, stp: int64, halts: int64 } <- call_registered(:engine, { op: op, side: side, trader: trader, px: px, qty: qty } impl ActorMessage {})
+    produces
+        pure s
+    end
+}
+
+// ---------------------------------------------------------------------------------------------
+// The traders. Each is a call-only actor whose state is its Strategy record and its random seed.
+// The three behaviours differ only in the record shape, which picks the Strategy implementation.
+
+fn maker(q: { bid: int64, ask: int64, last: int64, prev: int64 }, st: { params: { spread: int64, size: int64 }, seed: int64 }) -> (:reply, { kind: :limit | :market | :cancel, side: :buy | :sell, px: int64, qty: int64 }, { params: { spread: int64, size: int64 }, seed: int64 }) {
+    seed: int64 <- rng@next(st.seed);
+    (:reply, Strategy@decide(st.params, q, seed), { params: st.params, seed: seed })
+}
+
+fn chaser(q: { bid: int64, ask: int64, last: int64, prev: int64 }, st: { params: { size: int64, trigger: int64 }, seed: int64 }) -> (:reply, { kind: :limit | :market | :cancel, side: :buy | :sell, px: int64, qty: int64 }, { params: { size: int64, trigger: int64 }, seed: int64 }) {
+    seed: int64 <- rng@next(st.seed);
+    (:reply, Strategy@decide(st.params, q, seed), { params: st.params, seed: seed })
+}
+
+fn noisy(q: { bid: int64, ask: int64, last: int64, prev: int64 }, st: { params: { size: int64, odd_every: int64, wild_every: int64 }, seed: int64 }) -> (:reply, { kind: :limit | :market | :cancel, side: :buy | :sell, px: int64, qty: int64 }, { params: { size: int64, odd_every: int64, wild_every: int64 }, seed: int64 }) {
+    seed: int64 <- rng@next(st.seed);
+    (:reply, Strategy@decide(st.params, q, seed), { params: st.params, seed: seed })
+}
+
+fn ask_trader(k: int64, q: { bid: int64, ask: int64, last: int64, prev: int64 }) -> { kind: :limit | :market | :cancel, side: :buy | :sell, px: int64, qty: int64 } {
+    sequence proc[concurrency]
+        intent: { kind: :limit | :market | :cancel, side: :buy | :sell, px: int64, qty: int64 } <- call_registered(trader_atom(k), q impl ActorMessage {})
+    produces
+        pure intent
+    end
+}
+
+// ---------------------------------------------------------------------------------------------
+// The risk desk: a supervisor and its two workers. A worker's message is one packed ticket.
+
+fn init(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous, state_policy: state_policy }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_one, allowed_restart_count: 20, restarts_time_frame: 60 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous, state_policy: state_policy }, mem(normal)] <- [
+            { id: :risk_a, agent_type: :worker, initial_state: initial_state, behavior: risk_worker, restart: :permanent, shutdown: 0, flavor: :plain, state_policy: state_policy(:keep_state_area) },
+            { id: :risk_b, agent_type: :worker, initial_state: initial_state + 1, behavior: risk_worker, restart: :permanent, shutdown: 0, flavor: :plain, state_policy: state_policy(:keep_state_area) }
+        ]
+    produces pure (flags, children) end
+}
+
+// The most a round lot (100 shares) may be worth: $20,000.
+fn max_per_lot() -> int64 {
+    2000000
+}
+
+// The band a limit price must be within, in percent of the last trade.
+fn band_pct() -> int64 {
+    5
+}
+
+fn op_of(kind: :limit | :market | :cancel) -> :quote | :limit | :market | :cancel | :close {
+    case kind of {
+        :limit -> :limit;
+        :market -> :market;
+        :cancel -> :cancel
+    }
+}
+
+fn report(outcome: (:ack, int64, int64) | (:refused, int64) | (:crashed, int64)) -> boolean {
+    sequence proc[concurrency]
+        sent: boolean <- cast_registered(:driver, outcome impl ActorMessage {})
+    produces
+        pure sent
+    end
+}
+
+// Sends the ticket on to the engine and tells the driver what came of it.
+fn submit(t: { kind: :limit | :market | :cancel, side: :buy | :sell, trader: int64, px: int64, qty: int64, reference: int64 }) -> boolean {
+    s: { bid: int64, ask: int64, last: int64, prev: int64, fills: int64, filled: int64, rested: int64, bids: int64, asks: int64, stp: int64, halts: int64 } <- engine_request(op_of(t.kind), t.side, t.trader, t.px, t.qty);
+    report((:ack, s.fills, s.filled))
+}
+
+// The checks. Refusal codes: 1 the price is outside the band, 2 a round lot is worth too much.
+// The division by the number of round lots is the bug: an odd lot has none.
+fn check(t: { kind: :limit | :market | :cancel, side: :buy | :sell, trader: int64, px: int64, qty: int64, reference: int64 }) -> boolean {
+    lots: int64 <- t.qty / 100;
+    per_lot: int64 <- Priced@notional(t) / lots;
+    in_band: boolean <- case t.kind of {
+        :limit -> market@within_band(t.px, t.reference, band_pct());
+        _: atom -> true
+    };
+    case in_band of {
+        false -> report((:refused, 1));
+        true -> case per_lot > max_per_lot() of {
+            true -> report((:refused, 2));
+            false -> submit(t)
+        }
+    }
+}
+
+fn risk_worker(msg: int64, state: int64) -> (:no_reply, int64) {
+    t: { kind: :limit | :market | :cancel, side: :buy | :sell, trader: int64, px: int64, qty: int64, reference: int64 } <- codec@unpack(msg);
+    _: boolean <- case t.kind of {
+        :cancel -> submit(t);
+        _: atom -> check(t)
+    };
+    (:no_reply, state)
+}
+
+// The supervisor's report sink: one exit report per worker death, sent after the restart.
+fn sink(r: { child: actor_ref, child_id: atom, failure_reason: :normal | :language_error | :memory_fault | (:explicit, atom) | :noproc | :unknown, restarted: boolean, new_child: actor_ref }, state: int64) -> (:no_reply, int64) {
+    code: int64 <- case r.restarted of {
+        true -> 1;
+        false -> 0
+    };
+    _: boolean <- report((:crashed, code));
+    (:no_reply, state + 1)
+}
+
+// ---------------------------------------------------------------------------------------------
+// The driver: one order at a time, timer-paced.
+
+fn next_tick() -> timer_ref {
+    sequence proc[concurrency]
+        t: timer_ref <- send_after(1, self(), (:tick, 0) impl ActorMessage {})
+    produces
+        pure t
+    end
+}
+
+fn note(code: int64, order: int64, trader: int64) -> boolean {
+    to_tape((:note, code, order, trader))
+}
+
+// The session is over: the book's final shape and the order counts go to the tape, which prints the
+// market summary and hands the close on to the ledger.
+fn close(s: { order: int64, trader: int64, filled: int64, refused: int64, crashed: int64 }) -> { order: int64, trader: int64, filled: int64, refused: int64, crashed: int64 } {
+    st: { bid: int64, ask: int64, last: int64, prev: int64, fills: int64, filled: int64, rested: int64, bids: int64, asks: int64, stp: int64, halts: int64 } <- engine_request(:close, :buy, 0, 0, 0);
+    _: boolean <- to_tape((:close, st.bids, st.asks, s.order, s.refused, s.crashed, st.stp, st.halts));
+    s
+}
+
+// Asks trader k for an order and sends it to a risk worker.
+fn place(s: { order: int64, trader: int64, filled: int64, refused: int64, crashed: int64 }) -> { order: int64, trader: int64, filled: int64, refused: int64, crashed: int64 } {
+    k: int64 <- s.order % trader_count();
+    st: { bid: int64, ask: int64, last: int64, prev: int64, fills: int64, filled: int64, rested: int64, bids: int64, asks: int64, stp: int64, halts: int64 } <- engine_request(:quote, :buy, 0, 0, 0);
+    intent: { kind: :limit | :market | :cancel, side: :buy | :sell, px: int64, qty: int64 } <- ask_trader(k, { bid: st.bid, ask: st.ask, last: st.last, prev: st.prev });
+    ticket: int64 <- codec@pack(intent.kind, intent.side, k, intent.px, intent.qty, st.last);
+    sequence proc[concurrency]
+        _: boolean <- cast_registered(risk_worker_name(s.order), ticket impl ActorMessage {})
+    produces
+        pure { order: s.order + 1, trader: k, filled: s.filled, refused: s.refused, crashed: s.crashed }
+    end
+}
+
+fn on_tick(s: { order: int64, trader: int64, filled: int64, refused: int64, crashed: int64 }) -> { order: int64, trader: int64, filled: int64, refused: int64, crashed: int64 } {
+    case s.order == rounds() of {
+        true -> close(s);
+        false -> place(s)
+    }
+}
+
+fn driver(msg: (:tick, int64) | (:ack, int64, int64) | (:refused, int64) | (:crashed, int64), s: { order: int64, trader: int64, filled: int64, refused: int64, crashed: int64 }) -> (:no_reply, { order: int64, trader: int64, filled: int64, refused: int64, crashed: int64 }) {
+    case msg of {
+        (:tick, _n: int64) -> (:no_reply, on_tick(s));
+        (:ack, _fills: int64, qty: int64) -> {
+            _: timer_ref <- next_tick();
+            (:no_reply, { order: s.order, trader: s.trader, filled: s.filled + qty, refused: s.refused, crashed: s.crashed })
+        };
+        (:refused, code: int64) -> {
+            _: boolean <- note(code, s.order, s.trader);
+            _: timer_ref <- next_tick();
+            (:no_reply, { order: s.order, trader: s.trader, filled: s.filled, refused: s.refused + 1, crashed: s.crashed })
+        };
+        (:crashed, restarted: int64) -> {
+            _: boolean <- note(10 + restarted, s.order, s.trader);
+            _: timer_ref <- next_tick();
+            (:no_reply, { order: s.order, trader: s.trader, filled: s.filled, refused: s.refused, crashed: s.crashed + 1 })
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The tape: prints every trade as it happens, keeps them for the closing statistics and forwards
+// each one to the ledger. During the session it is the only actor that prints, so the output is in
+// a fixed order.
+
+fn print_trade(n: int64, b: int64, s: int64, px: int64, qty: int64) -> atom {
+    t: { buyer: int64, seller: int64, px: int64, qty: int64 } <- { buyer: b, seller: s, px: px, qty: qty };
+    sequence proc[device_io]
+        _: atom <- print("  #");
+        _: atom <- fmt@num(n, 3);
+        _: atom <- print("  ");
+        _: atom <- fmt@name(fmt@trader_name(b), 12);
+        _: atom <- print("buys ");
+        _: atom <- fmt@num(qty, 4);
+        _: atom <- print(" @");
+        _: atom <- fmt@price_w(px, 7);
+        _: atom <- print("  from ");
+        _: atom <- print(fmt@trader_name(s));
+        _: atom <- case Priced@is_block(t) of {
+            true -> println("  [block]");
+            false -> println("")
+        }
+    produces
+        pure :ok
+    end
+}
+
+fn print_note(code: int64, order: int64, trader: int64) -> atom {
+    sequence proc[device_io]
+        _: atom <- print("        ! order ");
+        _: atom <- print_int64(order);
+        _: atom <- print(" from ");
+        _: atom <- print(fmt@trader_name(trader));
+        _: atom <- case code of {
+            1 -> println(": refused, limit price outside the 5% band");
+            2 -> println(": refused, a round lot is worth more than $20,000");
+            11 -> println(": odd lot crashed the risk worker; the supervisor restarted it");
+            _: int64 -> println(": odd lot crashed the risk worker; it was not restarted")
+        }
+    produces
+        pure :ok
+    end
+}
+
+fn print_banner(code: int64, a: int64, b: int64) -> atom {
+    sequence proc[device_io]
+        _: atom <- case code of {
+            0 -> {
+                _: atom <- println("");
+                _: atom <- print("closing book (best ");
+                _: atom <- print_int64(a);
+                println(" levels a side)")
+            };
+            2 -> {
+                _: atom <- print("  *** halt: ");
+                _: atom <- fmt@price(a);
+                _: atom <- print(" is more than ");
+                _: atom <- fmt@price(halt_bp());
+                _: atom <- print("% from the reference ");
+                _: atom <- fmt@price(b);
+                _: atom <- print("; the book is frozen for ");
+                _: atom <- print_int64(halt_orders());
+                println(" orders")
+            };
+            3 -> {
+                _: atom <- print("  *** reopening auction at ");
+                _: atom <- fmt@price(a);
+                _: atom <- print(": ");
+                _: atom <- print_int64(b);
+                println(" shares uncrossed; continuous trading resumes")
+            };
+            _: int64 -> case a > 0 and b > 0 of {
+                true -> {
+                    _: atom <- print("                 ------ spread ");
+                    _: atom <- fmt@price(b - a);
+                    println(" ------")
+                };
+                false -> println("                 ------ one-sided book ------")
+            }
+        }
+    produces
+        pure :ok
+    end
+}
+
+fn print_level(side: int64, px: int64, qty: int64, orders: int64) -> atom {
+    sequence proc[device_io]
+        _: atom <- case side of {
+            1 -> print("                 ask ");
+            _: int64 -> print("                 bid ")
+        };
+        _: atom <- fmt@price_w(px, 7);
+        _: atom <- fmt@num(qty, 7);
+        _: atom <- print(" shares in ");
+        _: atom <- print_int64(orders);
+        _: atom <- case orders == 1 of {
+            true -> println(" order");
+            false -> println(" orders")
+        }
+    produces
+        pure :ok
+    end
+}
+
+fn print_summary(trades: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)], c: { bids: int64, asks: int64, orders: int64, refused: int64, crashed: int64, stp: int64, halts: int64 }) -> atom {
+    open: int64 <- stats@fold(trades, opening_price(), fn(_a: int64, t: { buyer: int64, seller: int64, px: int64, qty: int64 }) -> int64 { t.px });
+    sequence proc[device_io]
+        _: atom <- println("");
+        _: atom <- println("market summary");
+        _: atom <- print("  orders      ");
+        _: atom <- print_int64(c.orders);
+        _: atom <- print(" sent, ");
+        _: atom <- print_int64(c.refused);
+        _: atom <- print(" refused, ");
+        _: atom <- print_int64(c.crashed);
+        _: atom <- println(" crashed the risk desk");
+        _: atom <- print("  self-trades ");
+        _: atom <- print_int64(c.stp);
+        _: atom <- println(" prevented (resting order cancelled)");
+        _: atom <- print("  halts       ");
+        _: atom <- print_int64(c.halts);
+        _: atom <- println(" volatility halts, each ended by a call auction");
+        _: atom <- print("  trades      ");
+        _: atom <- print_int64(stats@count(trades));
+        _: atom <- print(" (");
+        _: atom <- print_int64(stats@blocks(trades));
+        _: atom <- println(" blocks)");
+        _: atom <- print("  volume      ");
+        _: atom <- print_int64(stats@volume(trades));
+        _: atom <- println(" shares");
+        _: atom <- print("  turnover    $");
+        _: atom <- fmt@price(stats@turnover(trades));
+        _: atom <- println("");
+        _: atom <- print("  open ");
+        _: atom <- fmt@price(open);
+        _: atom <- print("  high ");
+        _: atom <- fmt@price(stats@high(trades));
+        _: atom <- print("  low ");
+        _: atom <- fmt@price(stats@low(trades));
+        _: atom <- print("  close ");
+        _: atom <- fmt@price(stats@first_px(trades, opening_price()));
+        _: atom <- println("");
+        _: atom <- print("  vwap        ");
+        _: atom <- fmt@price(stats@vwap(trades));
+        _: atom <- println("");
+        _: atom <- print("  resting     ");
+        _: atom <- print_int64(c.bids);
+        _: atom <- print(" bids, ");
+        _: atom <- print_int64(c.asks);
+        _: atom <- println(" asks")
+    produces
+        pure :ok
+    end
+}
+
+fn cons_trade(t: { buyer: int64, seller: int64, px: int64, qty: int64 }, rest: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)]) -> List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)] {
+    sequence proc[mem(normal)]
+        out: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)] <- prepend[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)](t, rest)
+    produces
+        pure out
+    end
+}
+
+fn tape(msg: (:trade, int64, int64, int64, int64) | (:note, int64, int64, int64) | (:banner, int64, int64, int64) | (:level, int64, int64, int64, int64) | (:close, int64, int64, int64, int64, int64, int64, int64), st: { trades: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)], n: int64 }) -> (:no_reply, { trades: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)], n: int64 }) {
+    case msg of {
+        (:trade, b: int64, s: int64, px: int64, qty: int64) -> {
+            sequence proc[concurrency]
+                _: atom <- print_trade(st.n + 1, b, s, px, qty);
+                _: boolean <- cast_registered(:ledger, (:trade, b, s, px, qty) impl ActorMessage {})
+            produces
+                pure (:no_reply, { trades: cons_trade({ buyer: b, seller: s, px: px, qty: qty }, st.trades), n: st.n + 1 })
+            end
+        };
+        (:note, code: int64, order: int64, trader: int64) -> {
+            _: atom <- print_note(code, order, trader);
+            (:no_reply, st)
+        };
+        (:banner, code: int64, a: int64, b: int64) -> {
+            _: atom <- print_banner(code, a, b);
+            (:no_reply, st)
+        };
+        (:level, side: int64, px: int64, qty: int64, orders: int64) -> {
+            _: atom <- print_level(side, px, qty, orders);
+            (:no_reply, st)
+        };
+        (:close, bids: int64, asks: int64, orders: int64, refused: int64, crashed: int64, stp: int64, halts: int64) -> {
+            sequence proc[concurrency]
+                _: atom <- print_summary(st.trades, { bids: bids, asks: asks, orders: orders, refused: refused, crashed: crashed, stp: stp, halts: halts });
+                _: boolean <- cast_registered(:ledger, (:close, stats@first_px(st.trades, opening_price())) impl ActorMessage {})
+            produces
+                pure (:no_reply, st)
+            end
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The ledger: books every trade and, at the close, prints the positions and checks the books.
+
+fn print_accounts(xs: List[{ trader: int64, shares: int64, cash: int64 }, mem(normal)], mark: int64) -> atom {
+    case xs of {
+        []: List[{ trader: int64, shares: int64, cash: int64 }, mem(normal)] -> :ok;
+        [a: { trader: int64, shares: int64, cash: int64 }, rest: List[{ trader: int64, shares: int64, cash: int64 }, mem(normal)]] -> {
+            sequence proc[device_io]
+                _: atom <- print("  ");
+                _: atom <- fmt@name(fmt@trader_name(a.trader), 12);
+                _: atom <- fmt@signed(a.shares, 6);
+                _: atom <- print(" shares   cash ");
+                _: atom <- fmt@money_w(a.cash, 10);
+                _: atom <- print("   p&l ");
+                _: atom <- fmt@money_w(ledger@pnl(a, mark), 8);
+                _: atom <- println("")
+            produces
+                pure print_accounts(rest, mark)
+            end
+        }
+    }
+}
+
+fn verdict(ok: boolean) -> string {
+    case ok of {
+        true -> "ok";
+        false -> "BROKEN"
+    }
+}
+
+fn settle(accounts: List[{ trader: int64, shares: int64, cash: int64 }, mem(normal)], booked: int64, mark: int64) -> boolean {
+    shares_ok: boolean <- ledger@total_shares(accounts) == 0;
+    cash_ok: boolean <- ledger@total_cash(accounts) == 0;
+    sequence proc[device_io, concurrency]
+        _: atom <- println("");
+        _: atom <- print("positions at the close (marked at ");
+        _: atom <- fmt@price(mark);
+        _: atom <- println(")");
+        _: atom <- print_accounts(accounts, mark);
+        _: atom <- print("clearing: ");
+        _: atom <- print_int64(booked);
+        _: atom <- print(" trades booked, shares net to zero: ");
+        _: atom <- print(verdict(shares_ok));
+        _: atom <- print(", cash nets to zero: ");
+        _: atom <- println(verdict(cash_ok));
+        ended: boolean <- cast_exit(case shares_ok and cash_ok of { true -> 0; false -> 1 })
+    produces
+        pure ended
+    end
+}
+
+fn ledger_actor(msg: (:trade, int64, int64, int64, int64) | (:close, int64), st: { accounts: List[{ trader: int64, shares: int64, cash: int64 }, mem(normal)], booked: int64 }) -> (:no_reply, { accounts: List[{ trader: int64, shares: int64, cash: int64 }, mem(normal)], booked: int64 }) {
+    case msg of {
+        (:trade, b: int64, s: int64, px: int64, qty: int64) -> (:no_reply, { accounts: ledger@book_trade(st.accounts, { buyer: b, seller: s, px: px, qty: qty }), booked: st.booked + 1 });
+        (:close, mark: int64) -> {
+            _: boolean <- settle(st.accounts, st.booked, mark);
+            (:no_reply, st)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Start-up.
+
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// The FailureReporter: every crash report goes to standard error.
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[device_io]
+        _: atom <- println_stderr(report)
+    produces pure (:no_reply, state + 1) end
+}
+
+fn empty_book() -> { bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], next_id: int64, last: int64, prev: int64, stp: int64, phase: :continuous | :halted, halt_left: int64, reference: int64, halts: int64 } {
+    { bids: book@empty_side(), asks: book@empty_side(), next_id: 1, last: opening_price(), prev: opening_price(), stp: 0, phase: :continuous, halt_left: 0, reference: opening_price(), halts: 0 }
+}
+
+fn no_trades() -> List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)] {
+    sequence proc[mem(normal)]
+        out: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)] <- empty[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)]()
+    produces
+        pure out
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        rep: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: atom <- register_failure_reporter(rep);
+        _: actor_ref <- spawn_registered({ accounts: ledger@open_accounts(trader_count()), booked: 0 }, ledger_actor, :ledger, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: actor_ref <- spawn_registered({ trades: no_trades(), n: 0 }, tape, :tape, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: actor_ref <- spawn_registered(empty_book(), engine, :engine, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: actor_ref <- spawn_registered({ params: { spread: 20, size: 200 }, seed: 11 }, maker, :maker_tight, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: actor_ref <- spawn_registered({ params: { spread: 60, size: 500 }, seed: 23 }, maker, :maker_wide, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: actor_ref <- spawn_registered({ params: { size: 400, trigger: 10 }, seed: 37 }, chaser, :momentum, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: actor_ref <- spawn_registered({ params: { size: 100, odd_every: 9, wild_every: 13 }, seed: 97 }, noisy, :noise, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: actor_ref <- spawn_registered({ order: 0, trader: 0, filled: 0, refused: 0, crashed: 0 }, driver, :driver, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        s: actor_ref <- spawn(0, sink, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        sup: supervisor_ref <- spawn_registered_supervisor(RiskDesk, 1, :risk_desk, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        set: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(sup, { op: :set_report_sink, sink: s } impl SupervisorMessage {});
+        _: atom <- case set.status of {
+            :sink_set -> println("exchange open: 4 traders, 2 risk workers under a supervisor, opening price 100.00");
+            _: atom -> println("exchange open, but the risk desk has no report sink")
+        };
+        _: atom <- println("");
+        _: boolean <- cast_registered(:driver, (:tick, 0) impl ActorMessage {});
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

@@ -1,0 +1,63 @@
+// The risk desk's wire format: one order ticket packed into a single int64.
+//
+// The supervised risk workers take int64 messages, so the driver packs a ticket into one number and
+// the worker unpacks it again. Each field gets a fixed range of decimal digits:
+//
+//   ((((kind * 2 + side) * 10 + trader) * 100000 + px) * 100000 + qty) * 100000 + reference
+//
+//   kind       0 limit, 1 market, 2 cancel
+//   side       0 buy, 1 sell
+//   trader     0 .. 9
+//   px, qty    0 .. 99999 (cents, shares)
+//   reference  0 .. 99999, the last trade price the risk desk checks the order against
+//
+// The largest ticket is below 6 * 10^16, comfortably inside int64.
+
+export pack/6;
+export unpack/1;
+
+fn kind_code(kind: :limit | :market | :cancel) -> int64 {
+    case kind of {
+        :limit -> 0;
+        :market -> 1;
+        :cancel -> 2
+    }
+}
+
+fn side_code(side: :buy | :sell) -> int64 {
+    case side of {
+        :buy -> 0;
+        :sell -> 1
+    }
+}
+
+fn pack(kind: :limit | :market | :cancel, side: :buy | :sell, trader: int64, px: int64, qty: int64, reference: int64) -> int64 {
+    ((((kind_code(kind) * 2 + side_code(side)) * 10 + trader) * 100000 + px) * 100000 + qty) * 100000 + reference
+}
+
+fn kind_of(code: int64) -> :limit | :market | :cancel {
+    case code of {
+        0 -> :limit;
+        1 -> :market;
+        _: int64 -> :cancel
+    }
+}
+
+fn side_of(code: int64) -> :buy | :sell {
+    case code of {
+        0 -> :buy;
+        _: int64 -> :sell
+    }
+}
+
+fn unpack(m: int64) -> { kind: :limit | :market | :cancel, side: :buy | :sell, trader: int64, px: int64, qty: int64, reference: int64 } {
+    head: int64 <- m / 1000000000000000;
+    {
+        kind: kind_of(head / 20),
+        side: side_of((head / 10) % 2),
+        trader: head % 10,
+        px: (m / 10000000000) % 100000,
+        qty: (m / 100000) % 100000,
+        reference: m % 100000
+    }
+}

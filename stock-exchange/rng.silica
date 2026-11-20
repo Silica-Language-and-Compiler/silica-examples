@@ -1,0 +1,17 @@
+// A deterministic pseudo-random number generator, so every run of the exchange is the same.
+//
+// It is the classic linear congruential generator x' = (1103515245 x + 12345) mod 2^31. The state
+// stays below 2^31, so the product stays far below the int64 limit and never overflows. The low bits
+// of an LCG are weak, so draws come from the high bits (x / 65536).
+
+export next/1;
+export below/2;
+
+fn next(seed: int64) -> int64 {
+    (seed * 1103515245 + 12345) % 2147483648
+}
+
+// A draw in 0 .. n - 1 from the current state.
+fn below(seed: int64, n: int64) -> int64 {
+    (seed / 65536) % n
+}

@@ -1,0 +1,112 @@
+// The Strategy trait: how a trader turns a market snapshot into its next order.
+//
+// Silica has no classes and no generics. A trait is a module named after itself; each `impl fn`
+// covers one concrete record shape, and the record's fields are that strategy's parameters. Three
+// shapes implement Strategy here:
+//
+//   market maker  { spread, size }               quotes both sides of the mid, often cancels
+//   momentum      { size, trigger }              chases the last price move with market orders
+//   noise         { size, odd_every, wild_every } random orders, with the occasional odd lot or
+//                                                fat-fingered price (the risk desk's test cases)
+//
+// decide gets the snapshot q (best bid, best ask, last and previous trade price) and a fresh random
+// draw, and returns an order intent. The provided method `quote_mid` is shared by every strategy.
+
+use market;
+use rng;
+
+export trait Strategy;
+export decide/3;
+export style/1;
+export quote_mid/2;
+
+required {
+    fn decide(s: Strategy, q: { bid: int64, ask: int64, last: int64, prev: int64 }, seed: int64) -> { kind: :limit | :market | :cancel, side: :buy | :sell, px: int64, qty: int64 };
+    fn style(s: Strategy) -> string;
+}
+
+provided {
+    fn quote_mid(s: Strategy, q: { bid: int64, ask: int64, last: int64, prev: int64 }) -> int64 {
+        case Strategy@style(s) == "noise" of {
+            true -> q.last;
+            false -> market@mid(q.bid, q.ask, q.last, q.prev)
+        }
+    }
+}
+
+// ---- market maker ----
+
+impl fn decide(m: { spread: int64, size: int64 }, q: { bid: int64, ask: int64, last: int64, prev: int64 }, seed: int64) -> { kind: :limit | :market | :cancel, side: :buy | :sell, px: int64, qty: int64 } {
+    centre: int64 <- Strategy@quote_mid(m, q);
+    roll: int64 <- rng@below(seed, 10);
+    half: int64 <- m.spread / 2;
+    case roll < 4 of {
+        true -> case roll % 2 == 0 of {
+            true -> { kind: :cancel, side: :buy, px: 0, qty: 0 };
+            false -> { kind: :cancel, side: :sell, px: 0, qty: 0 }
+        };
+        false -> case roll % 2 == 0 of {
+            true -> { kind: :limit, side: :buy, px: market@on_tick(centre - half), qty: m.size };
+            false -> { kind: :limit, side: :sell, px: market@on_tick(centre + half + market@tick()), qty: m.size }
+        }
+    }
+}
+
+impl fn style(_m: { spread: int64, size: int64 }) -> string {
+    "market maker"
+}
+
+// ---- momentum ----
+
+fn passive(t: { size: int64, trigger: int64 }, q: { bid: int64, ask: int64, last: int64, prev: int64 }, seed: int64) -> { kind: :limit | :market | :cancel, side: :buy | :sell, px: int64, qty: int64 } {
+    case rng@below(seed, 2) == 0 of {
+        true -> { kind: :limit, side: :buy, px: market@on_tick(q.last - t.trigger), qty: t.size };
+        false -> { kind: :limit, side: :sell, px: market@on_tick(q.last + t.trigger), qty: t.size }
+    }
+}
+
+impl fn decide(t: { size: int64, trigger: int64 }, q: { bid: int64, ask: int64, last: int64, prev: int64 }, seed: int64) -> { kind: :limit | :market | :cancel, side: :buy | :sell, px: int64, qty: int64 } {
+    move: int64 <- q.last - q.prev;
+    case move >= t.trigger of {
+        true -> { kind: :market, side: :buy, px: 0, qty: t.size };
+        false -> case move <= 0 - t.trigger of {
+            true -> { kind: :market, side: :sell, px: 0, qty: t.size };
+            false -> passive(t, q, seed)
+        }
+    }
+}
+
+impl fn style(_t: { size: int64, trigger: int64 }) -> string {
+    "momentum"
+}
+
+// ---- noise ----
+
+fn noise_side(seed: int64) -> :buy | :sell {
+    case rng@below(seed, 2) of {
+        0 -> :buy;
+        _: int64 -> :sell
+    }
+}
+
+impl fn decide(n: { size: int64, odd_every: int64, wild_every: int64 }, q: { bid: int64, ask: int64, last: int64, prev: int64 }, seed: int64) -> { kind: :limit | :market | :cancel, side: :buy | :sell, px: int64, qty: int64 } {
+    centre: int64 <- Strategy@quote_mid(n, q);
+    draw: int64 <- rng@below(seed, 1000);
+    side: :buy | :sell <- noise_side(rng@next(seed));
+    offset: int64 <- (draw % 13 - 6) * market@tick();
+    lots: int64 <- 1 + draw % 4;
+    case draw % n.odd_every == 0 of {
+        true -> { kind: :limit, side: side, px: market@on_tick(centre + offset), qty: 50 };
+        false -> case draw % n.wild_every == 0 of {
+            true -> { kind: :limit, side: side, px: market@on_tick(centre * 2), qty: n.size };
+            false -> case draw % 3 == 0 of {
+                true -> { kind: :market, side: side, px: 0, qty: n.size * lots };
+                false -> { kind: :limit, side: side, px: market@on_tick(centre + offset), qty: n.size * lots }
+            }
+        }
+    }
+}
+
+impl fn style(_n: { size: int64, odd_every: int64, wild_every: int64 }) -> string {
+    "noise"
+}
