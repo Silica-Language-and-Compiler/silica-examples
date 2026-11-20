@@ -1,0 +1,56 @@
+// Small pieces of market arithmetic shared by the strategies, the risk desk and the engine.
+//
+// Prices are integers in cents (10000 is $100.00), and every price an order carries is rounded to
+// the exchange's tick of 5 cents.
+
+export tick/0;
+export mid/4;
+export on_tick/1;
+export abs/1;
+export within_band/3;
+export within_bp/3;
+
+fn tick() -> int64 {
+    5
+}
+
+fn abs(x: int64) -> int64 {
+    case x < 0 of {
+        true -> 0 - x;
+        false -> x
+    }
+}
+
+// Rounds a price down to a whole tick, and never below one tick.
+fn on_tick(px: int64) -> int64 {
+    rounded: int64 <- px - px % tick();
+    case rounded < tick() of {
+        true -> tick();
+        false -> rounded
+    }
+}
+
+// The middle of the spread when both sides have a price, otherwise the side there is, otherwise the
+// last trade. An empty side is reported as 0.
+fn mid(bid: int64, ask: int64, last: int64, _prev: int64) -> int64 {
+    case bid > 0 and ask > 0 of {
+        true -> on_tick((bid + ask) / 2);
+        false -> case bid > 0 of {
+            true -> bid;
+            false -> case ask > 0 of {
+                true -> ask;
+                false -> last
+            }
+        }
+    }
+}
+
+// Whether px is within pct percent of the reference price.
+fn within_band(px: int64, reference: int64, pct: int64) -> boolean {
+    abs(px - reference) * 100 <= reference * pct
+}
+
+// Whether px is within bp basis points (hundredths of a percent) of the reference price.
+fn within_bp(px: int64, reference: int64, bp: int64) -> boolean {
+    abs(px - reference) * 10000 <= reference * bp
+}

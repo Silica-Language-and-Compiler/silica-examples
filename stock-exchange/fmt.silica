@@ -1,0 +1,122 @@
+// Printing helpers: prices and money in dollars and cents, right-aligned numbers, padded names.
+
+export trader_name/1;
+export price/1;
+export money/1;
+export num/2;
+export name/2;
+export signed/2;
+export price_w/2;
+export money_w/2;
+
+fn trader_name(i: int64) -> string {
+    case i of {
+        0 -> "maker-tight";
+        1 -> "maker-wide";
+        2 -> "momentum";
+        _: int64 -> "noise"
+    }
+}
+
+fn digits(n: int64) -> int64 {
+    case n < 10 of {
+        true -> 1;
+        false -> 1 + digits(n / 10)
+    }
+}
+
+fn spaces(n: int64) -> atom {
+    case n <= 0 of {
+        true -> :ok;
+        false -> {
+            sequence proc[device_io]
+                _: atom <- print(" ")
+            produces
+                pure spaces(n - 1)
+            end
+        }
+    }
+}
+
+fn cents(c: int64) -> atom {
+    sequence proc[device_io]
+        _: atom <- print_int64(c / 100);
+        _: atom <- print(".");
+        _: atom <- case c % 100 < 10 of {
+            true -> print("0");
+            false -> :ok
+        };
+        _: atom <- print_int64(c % 100)
+    produces
+        pure :ok
+    end
+}
+
+// A price in cents as dollars, e.g. 10045 -> 100.45.
+fn price(px: int64) -> atom {
+    cents(px)
+}
+
+// Money in cents as signed dollars, e.g. -123456 -> -1234.56.
+fn money(c: int64) -> atom {
+    sequence proc[device_io]
+        _: atom <- case c < 0 of {
+            true -> print("-");
+            false -> print("+")
+        }
+    produces
+        pure cents(case c < 0 of { true -> 0 - c; false -> c })
+    end
+}
+
+// n right-aligned in a field of the given width.
+fn num(n: int64, width: int64) -> atom {
+    sequence proc[device_io]
+        _: atom <- spaces(width - digits(case n < 0 of { true -> 0 - n; false -> n }) - case n < 0 of { true -> 1; false -> 0 });
+        _: atom <- print_int64(n)
+    produces
+        pure :ok
+    end
+}
+
+// n with an explicit sign, right-aligned in a field of the given width.
+fn signed(n: int64, width: int64) -> atom {
+    magnitude: int64 <- case n < 0 of { true -> 0 - n; false -> n };
+    sequence proc[device_io]
+        _: atom <- spaces(width - digits(magnitude) - 1);
+        _: atom <- case n < 0 of {
+            true -> print("-");
+            false -> print("+")
+        };
+        _: atom <- print_int64(magnitude)
+    produces
+        pure :ok
+    end
+}
+
+// s left-aligned in a field of the given width.
+fn name(s: string, width: int64) -> atom {
+    sequence proc[device_io]
+        _: atom <- print(s)
+    produces
+        pure spaces(width - length_bytes(s))
+    end
+}
+
+// The number of characters cents(c) prints for c >= 0: the dollars, the point and two digits.
+fn cents_width(c: int64) -> int64 {
+    digits(c / 100) + 3
+}
+
+// A price right-aligned in a field of the given width.
+fn price_w(px: int64, width: int64) -> atom {
+    _: atom <- spaces(width - cents_width(px));
+    cents(px)
+}
+
+// Signed money right-aligned in a field of the given width.
+fn money_w(c: int64, width: int64) -> atom {
+    magnitude: int64 <- case c < 0 of { true -> 0 - c; false -> c };
+    _: atom <- spaces(width - cents_width(magnitude) - 1);
+    money(c)
+}

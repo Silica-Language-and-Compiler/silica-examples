@@ -1,0 +1,341 @@
+// The limit order book: pure price-time priority matching.
+//
+// A resting order is { id, trader, px, qty }. The book keeps two lists of them:
+//
+//   bids: best (highest) price first; among equal prices, the oldest first.
+//   asks: best (lowest) price first; among equal prices, the oldest first.
+//
+// An incoming buy walks the asks while the best ask is at or below its limit, and an incoming sell
+// walks the bids while the best bid is at or above its limit. Every cross is a trade at the RESTING
+// order's price (the maker's price), and a partly filled resting order keeps its place in the queue.
+// Whatever is left of a limit order then rests in the book; whatever is left of a market order is
+// dropped (immediate-or-cancel).
+//
+// While trading is halted, orders only rest (rest_order). The halt ends with a call auction
+// (auction): every order that can trade, trades at ONE price, the price at which the most shares
+// change hands. Nothing here has an effect except building lists (mem(normal)).
+
+export empty_side/0;
+export match_order/5;
+export cancel/2;
+export depth/1;
+export volume/1;
+export best/2;
+export levels/2;
+export rest_order/3;
+export auction/3;
+
+fn empty_side() -> List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)] {
+    sequence proc[mem(normal)]
+        out: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)] <- empty[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)]()
+    produces
+        pure out
+    end
+}
+
+fn cons(o: { id: int64, trader: int64, px: int64, qty: int64 }, rest: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)]) -> List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)] {
+    sequence proc[mem(normal)]
+        out: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)] <- prepend[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)](o, rest)
+    produces
+        pure out
+    end
+}
+
+fn no_trades() -> List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)] {
+    sequence proc[mem(normal)]
+        out: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)] <- empty[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)]()
+    produces
+        pure out
+    end
+}
+
+fn cons_trade(t: { buyer: int64, seller: int64, px: int64, qty: int64 }, rest: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)]) -> List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)] {
+    sequence proc[mem(normal)]
+        out: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)] <- prepend[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)](t, rest)
+    produces
+        pure out
+    end
+}
+
+fn min(a: int64, b: int64) -> int64 {
+    case a < b of {
+        true -> a;
+        false -> b
+    }
+}
+
+// Whether a resting order at price p is reachable by an incoming order of this side and limit.
+fn crosses(side: :buy | :sell, limit: int64, p: int64) -> boolean {
+    case side of {
+        :buy -> p <= limit;
+        :sell -> p >= limit
+    }
+}
+
+// Whether a new order at price p goes in front of a resting order at price q on its own side.
+// Strictly better only: an equal price queues behind (time priority).
+fn ahead(side: :buy | :sell, p: int64, q: int64) -> boolean {
+    case side of {
+        :buy -> p > q;
+        :sell -> p < q
+    }
+}
+
+// One trade between the incoming order and a resting maker, from the buyer's and seller's view.
+fn trade_of(side: :buy | :sell, taker: int64, maker: int64, px: int64, qty: int64) -> { buyer: int64, seller: int64, px: int64, qty: int64 } {
+    case side of {
+        :buy -> { buyer: taker, seller: maker, px: px, qty: qty };
+        :sell -> { buyer: maker, seller: taker, px: px, qty: qty }
+    }
+}
+
+// Walks the opposite side. Returns what is left of that side, the quantity still unfilled, the
+// trades made (newest first) and how many resting orders were cancelled by self-trade prevention:
+// a trader never trades with itself, so when the incoming order reaches one of the same trader's
+// resting orders, that resting order is cancelled and the sweep goes on ("cancel resting").
+fn sweep(opp: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], side: :buy | :sell, trader: int64, limit: int64, left: int64, acc: { trades: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)], stp: int64 }) -> { opp: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], left: int64, trades: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)], stp: int64 } {
+    case left == 0 of {
+        true -> { opp: opp, left: 0, trades: acc.trades, stp: acc.stp };
+        false -> case opp of {
+            []: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)] -> { opp: opp, left: left, trades: acc.trades, stp: acc.stp };
+            [h: { id: int64, trader: int64, px: int64, qty: int64 }, t: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)]] -> case crosses(side, limit, h.px) of {
+                false -> { opp: opp, left: left, trades: acc.trades, stp: acc.stp };
+                true -> case h.trader == trader of {
+                    true -> sweep(t, side, trader, limit, left, { trades: acc.trades, stp: acc.stp + 1 });
+                    false -> {
+                        q: int64 <- min(left, h.qty);
+                        trades: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)] <- cons_trade(trade_of(side, trader, h.trader, h.px, q), acc.trades);
+                        case q == h.qty of {
+                            true -> sweep(t, side, trader, limit, left - q, { trades: trades, stp: acc.stp });
+                            false -> { opp: cons({ id: h.id, trader: h.trader, px: h.px, qty: h.qty - q }, t), left: left - q, trades: trades, stp: acc.stp }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Puts a resting order into its own side, behind every order at the same or a better price.
+fn insert(own: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], side: :buy | :sell, o: { id: int64, trader: int64, px: int64, qty: int64 }) -> List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)] {
+    case own of {
+        []: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)] -> cons(o, own);
+        [h: { id: int64, trader: int64, px: int64, qty: int64 }, t: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)]] -> case ahead(side, o.px, h.px) of {
+            true -> cons(o, own);
+            false -> cons(h, insert(t, side, o))
+        }
+    }
+}
+
+fn reverse_trades(xs: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)], acc: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)]) -> List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)] {
+    case xs of {
+        []: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)] -> acc;
+        [h: { buyer: int64, seller: int64, px: int64, qty: int64 }, t: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)]] -> reverse_trades(t, cons_trade(h, acc))
+    }
+}
+
+// Matches one order. own is the order's side of the book, opp the other side. rest is true for a
+// limit order (the remainder rests) and false for a market order (the remainder is dropped).
+// Returns both sides after the match, the trades in the order they happened, the quantity that
+// went into the book and the number of self-trade cancellations.
+fn match_order(own: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], opp: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], side: :buy | :sell, o: { id: int64, trader: int64, px: int64, qty: int64 }, rest: boolean) -> { own: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], opp: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], trades: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)], rested: int64, stp: int64 } {
+    s: { opp: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], left: int64, trades: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)], stp: int64 } <- sweep(opp, side, o.trader, o.px, o.qty, { trades: no_trades(), stp: 0 });
+    in_order: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)] <- reverse_trades(s.trades, no_trades());
+    case rest and s.left > 0 of {
+        true -> { own: insert(own, side, { id: o.id, trader: o.trader, px: o.px, qty: s.left }), opp: s.opp, trades: in_order, rested: s.left, stp: s.stp };
+        false -> { own: own, opp: s.opp, trades: in_order, rested: 0, stp: s.stp }
+    }
+}
+
+// The side without the oldest order of this trader (a trader cancels its stalest quote first). The
+// second field says whether the trader had an order on that side.
+fn cancel(xs: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], trader: int64) -> (List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], boolean) {
+    case xs of {
+        []: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)] -> (xs, false);
+        [h: { id: int64, trader: int64, px: int64, qty: int64 }, t: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)]] -> case h.trader == trader of {
+            true -> (t, true);
+            false -> {
+                (rest: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], found: boolean) <- cancel(t, trader);
+                (cons(h, rest), found)
+            }
+        }
+    }
+}
+
+// How many orders rest on a side.
+fn depth(xs: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)]) -> int64 {
+    case xs of {
+        []: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)] -> 0;
+        [_h: { id: int64, trader: int64, px: int64, qty: int64 }, t: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)]] -> 1 + depth(t)
+    }
+}
+
+// How many shares rest on a side.
+fn volume(xs: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)]) -> int64 {
+    case xs of {
+        []: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)] -> 0;
+        [h: { id: int64, trader: int64, px: int64, qty: int64 }, t: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)]] -> h.qty + volume(t)
+    }
+}
+
+// The best price on a side, or the fallback when the side is empty.
+fn best(xs: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], fallback: int64) -> int64 {
+    case xs of {
+        []: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)] -> fallback;
+        [h: { id: int64, trader: int64, px: int64, qty: int64 }, _t: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)]] -> h.px
+    }
+}
+
+fn cons_level(l: { px: int64, qty: int64, orders: int64 }, rest: List[{ px: int64, qty: int64, orders: int64 }, mem(normal)]) -> List[{ px: int64, qty: int64, orders: int64 }, mem(normal)] {
+    sequence proc[mem(normal)]
+        out: List[{ px: int64, qty: int64, orders: int64 }, mem(normal)] <- prepend[{ px: int64, qty: int64, orders: int64 }, mem(normal)](l, rest)
+    produces
+        pure out
+    end
+}
+
+fn no_levels() -> List[{ px: int64, qty: int64, orders: int64 }, mem(normal)] {
+    sequence proc[mem(normal)]
+        out: List[{ px: int64, qty: int64, orders: int64 }, mem(normal)] <- empty[{ px: int64, qty: int64, orders: int64 }, mem(normal)]()
+    produces
+        pure out
+    end
+}
+
+// Adds one resting order to the level it belongs to. A side is sorted by price, so an order's level
+// is either the one being built (cur) or a new one; the finished levels collect in done, best first.
+fn gather(xs: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], cur: { px: int64, qty: int64, orders: int64 }, done: List[{ px: int64, qty: int64, orders: int64 }, mem(normal)], k: int64) -> List[{ px: int64, qty: int64, orders: int64 }, mem(normal)] {
+    case xs of {
+        []: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)] -> cons_level(cur, done);
+        [h: { id: int64, trader: int64, px: int64, qty: int64 }, t: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)]] -> case h.px == cur.px of {
+            true -> gather(t, { px: cur.px, qty: cur.qty + h.qty, orders: cur.orders + 1 }, done, k);
+            false -> case k == 1 of {
+                true -> cons_level(cur, done);
+                false -> gather(t, { px: h.px, qty: h.qty, orders: 1 }, cons_level(cur, done), k - 1)
+            }
+        }
+    }
+}
+
+fn reverse_levels(xs: List[{ px: int64, qty: int64, orders: int64 }, mem(normal)], acc: List[{ px: int64, qty: int64, orders: int64 }, mem(normal)]) -> List[{ px: int64, qty: int64, orders: int64 }, mem(normal)] {
+    case xs of {
+        []: List[{ px: int64, qty: int64, orders: int64 }, mem(normal)] -> acc;
+        [h: { px: int64, qty: int64, orders: int64 }, t: List[{ px: int64, qty: int64, orders: int64 }, mem(normal)]] -> reverse_levels(t, cons_level(h, acc))
+    }
+}
+
+// The best k price levels of a side, best first: each level's price, total shares and order count.
+fn levels(xs: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], k: int64) -> List[{ px: int64, qty: int64, orders: int64 }, mem(normal)] {
+    case xs of {
+        []: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)] -> no_levels();
+        [h: { id: int64, trader: int64, px: int64, qty: int64 }, t: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)]] -> reverse_levels(gather(t, { px: h.px, qty: h.qty, orders: 1 }, no_levels(), k), no_levels())
+    }
+}
+
+// ---- halts and the reopening auction ----
+
+// Puts an order into its side without matching it, as during a halt.
+fn rest_order(own: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], side: :buy | :sell, o: { id: int64, trader: int64, px: int64, qty: int64 }) -> List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)] {
+    insert(own, side, o)
+}
+
+// Shares bid at p or higher.
+fn demand(bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], p: int64) -> int64 {
+    case bids of {
+        []: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)] -> 0;
+        [h: { id: int64, trader: int64, px: int64, qty: int64 }, t: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)]] -> case h.px >= p of {
+            true -> h.qty + demand(t, p);
+            false -> 0
+        }
+    }
+}
+
+// Shares offered at p or lower.
+fn supply(asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], p: int64) -> int64 {
+    case asks of {
+        []: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)] -> 0;
+        [h: { id: int64, trader: int64, px: int64, qty: int64 }, t: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)]] -> case h.px <= p of {
+            true -> h.qty + supply(t, p);
+            false -> 0
+        }
+    }
+}
+
+// How good an auction price p is, as one comparable number: first the shares that would trade,
+// then the smaller imbalance between demand and supply, then the closer distance to the reference
+// price. Volume and imbalance stay below 10^6 shares and the distance below 10^5 cents.
+fn score(bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], p: int64, reference: int64) -> int64 {
+    d: int64 <- demand(bids, p);
+    o: int64 <- supply(asks, p);
+    exec: int64 <- min(d, o);
+    imbalance: int64 <- case d > o of {
+        true -> d - o;
+        false -> o - d
+    };
+    distance: int64 <- case p > reference of {
+        true -> p - reference;
+        false -> reference - p
+    };
+    (exec * 1000000 + (999999 - imbalance)) * 100000 + (99999 - distance)
+}
+
+// The best-scoring price among the candidates (every limit price in the book), as (score, price).
+fn best_price(cands: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], reference: int64, best: (int64, int64)) -> (int64, int64) {
+    case cands of {
+        []: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)] -> best;
+        [h: { id: int64, trader: int64, px: int64, qty: int64 }, t: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)]] -> {
+            (top: int64, _px: int64) <- best;
+            here: int64 <- score(bids, asks, h.px, reference);
+            case here > top of {
+                true -> best_price(t, bids, asks, reference, (here, h.px));
+                false -> best_price(t, bids, asks, reference, best)
+            }
+        }
+    }
+}
+
+// Crosses the best bid with the best ask at price p until they no longer cross. A self-trade
+// cancels the younger of the two orders instead.
+fn uncross(bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], p: int64, trades: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)]) -> { bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], trades: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)] } {
+    case bids of {
+        []: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)] -> { bids: bids, asks: asks, trades: trades };
+        [b: { id: int64, trader: int64, px: int64, qty: int64 }, bt: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)]] -> case asks of {
+            []: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)] -> { bids: bids, asks: asks, trades: trades };
+            [a: { id: int64, trader: int64, px: int64, qty: int64 }, at: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)]] -> case b.px >= p and a.px <= p of {
+                false -> { bids: bids, asks: asks, trades: trades };
+                true -> case b.trader == a.trader of {
+                    true -> case b.id > a.id of {
+                        true -> uncross(bt, asks, p, trades);
+                        false -> uncross(bids, at, p, trades)
+                    };
+                    false -> {
+                        q: int64 <- min(b.qty, a.qty);
+                        done: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)] <- cons_trade({ buyer: b.trader, seller: a.trader, px: p, qty: q }, trades);
+                        rest_b: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)] <- case q == b.qty of {
+                            true -> bt;
+                            false -> cons({ id: b.id, trader: b.trader, px: b.px, qty: b.qty - q }, bt)
+                        };
+                        rest_a: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)] <- case q == a.qty of {
+                            true -> at;
+                            false -> cons({ id: a.id, trader: a.trader, px: a.px, qty: a.qty - q }, at)
+                        };
+                        uncross(rest_b, rest_a, p, done)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The reopening auction. Returns the book after it, the trades in the order they happened and the
+// auction price (the reference price when nothing can trade).
+fn auction(bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], reference: int64) -> { bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], trades: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)], px: int64 } {
+    (top: int64, px: int64) <- best_price(asks, bids, asks, reference, best_price(bids, bids, asks, reference, (0, reference)));
+    case top / 100000000000 == 0 of {
+        true -> { bids: bids, asks: asks, trades: no_trades(), px: reference };
+        false -> {
+            u: { bids: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], asks: List[{ id: int64, trader: int64, px: int64, qty: int64 }, mem(normal)], trades: List[{ buyer: int64, seller: int64, px: int64, qty: int64 }, mem(normal)] } <- uncross(bids, asks, px, no_trades());
+            { bids: u.bids, asks: u.asks, trades: reverse_trades(u.trades, no_trades()), px: px }
+        }
+    }
+}

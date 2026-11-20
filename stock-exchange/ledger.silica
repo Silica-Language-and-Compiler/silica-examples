@@ -1,0 +1,79 @@
+// The clearing ledger: every trader's share position and cash balance, in cents.
+//
+// A trade moves qty shares from the seller to the buyer and qty * px cents the other way, so across
+// all accounts both sums stay exactly zero. `balanced` checks that invariant at the close: if a trade
+// were lost, doubled or booked to the wrong side the sums would no longer be zero.
+
+export open_accounts/1;
+export book_trade/2;
+export total_shares/1;
+export total_cash/1;
+export pnl/2;
+
+fn nil() -> List[{ trader: int64, shares: int64, cash: int64 }, mem(normal)] {
+    sequence proc[mem(normal)]
+        out: List[{ trader: int64, shares: int64, cash: int64 }, mem(normal)] <- empty[{ trader: int64, shares: int64, cash: int64 }, mem(normal)]()
+    produces
+        pure out
+    end
+}
+
+fn cons(a: { trader: int64, shares: int64, cash: int64 }, rest: List[{ trader: int64, shares: int64, cash: int64 }, mem(normal)]) -> List[{ trader: int64, shares: int64, cash: int64 }, mem(normal)] {
+    sequence proc[mem(normal)]
+        out: List[{ trader: int64, shares: int64, cash: int64 }, mem(normal)] <- prepend[{ trader: int64, shares: int64, cash: int64 }, mem(normal)](a, rest)
+    produces
+        pure out
+    end
+}
+
+// Accounts 0 .. n - 1, all flat.
+fn open_from(i: int64, n: int64) -> List[{ trader: int64, shares: int64, cash: int64 }, mem(normal)] {
+    case i >= n of {
+        true -> nil();
+        false -> cons({ trader: i, shares: 0, cash: 0 }, open_from(i + 1, n))
+    }
+}
+
+fn open_accounts(n: int64) -> List[{ trader: int64, shares: int64, cash: int64 }, mem(normal)] {
+    open_from(0, n)
+}
+
+// Applies one side of a trade to the account that owns it: +qty shares and -cash for the buyer,
+// -qty shares and +cash for the seller. A self-trade (buyer == seller) nets to nothing.
+fn post(a: { trader: int64, shares: int64, cash: int64 }, t: { buyer: int64, seller: int64, px: int64, qty: int64 }) -> { trader: int64, shares: int64, cash: int64 } {
+    bought: int64 <- case a.trader == t.buyer of {
+        true -> t.qty;
+        false -> 0
+    };
+    sold: int64 <- case a.trader == t.seller of {
+        true -> t.qty;
+        false -> 0
+    };
+    { trader: a.trader, shares: a.shares + bought - sold, cash: a.cash + (sold - bought) * t.px }
+}
+
+fn book_trade(xs: List[{ trader: int64, shares: int64, cash: int64 }, mem(normal)], t: { buyer: int64, seller: int64, px: int64, qty: int64 }) -> List[{ trader: int64, shares: int64, cash: int64 }, mem(normal)] {
+    case xs of {
+        []: List[{ trader: int64, shares: int64, cash: int64 }, mem(normal)] -> xs;
+        [h: { trader: int64, shares: int64, cash: int64 }, rest: List[{ trader: int64, shares: int64, cash: int64 }, mem(normal)]] -> cons(post(h, t), book_trade(rest, t))
+    }
+}
+
+fn total_shares(xs: List[{ trader: int64, shares: int64, cash: int64 }, mem(normal)]) -> int64 {
+    case xs of {
+        []: List[{ trader: int64, shares: int64, cash: int64 }, mem(normal)] -> 0;
+        [h: { trader: int64, shares: int64, cash: int64 }, rest: List[{ trader: int64, shares: int64, cash: int64 }, mem(normal)]] -> h.shares + total_shares(rest)
+    }
+}
+
+fn total_cash(xs: List[{ trader: int64, shares: int64, cash: int64 }, mem(normal)]) -> int64 {
+    case xs of {
+        []: List[{ trader: int64, shares: int64, cash: int64 }, mem(normal)] -> 0;
+        [h: { trader: int64, shares: int64, cash: int64 }, rest: List[{ trader: int64, shares: int64, cash: int64 }, mem(normal)]] -> h.cash + total_cash(rest)
+    }
+}
+
+// Profit and loss marked to the closing price: cash plus the shares valued at that price.
+fn pnl(a: { trader: int64, shares: int64, cash: int64 }, mark: int64) -> int64 {
+    a.cash + a.shares * mark
+}
